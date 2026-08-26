@@ -81,4 +81,4 @@ Client dump only. ServerScriptService / ServerStorage that never replicates is i
 
 ## License
 
-Source available. See `LICENSE`. Not licensed for reuse.
+Reuse is fine. Give credit — keep ff0l and a link to this repo somewhere obvious. See `LICENSE`.
