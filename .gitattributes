@@ -1,0 +1,3 @@
+# Force correct Linguist classification for GitHub language stats / profile cards.
+*.lua linguist-detectable=true linguist-language=Lua
+*.luau linguist-detectable=true linguist-language=Lua
