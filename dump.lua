@@ -20,9 +20,11 @@ local env = (typeof(getgenv) == "function" and getgenv()) or _G
 if type(env) == "table" and type(env.UNIVERSAL_DUMP_UNLOAD) == "function" then
 	pcall(env.UNIVERSAL_DUMP_UNLOAD)
 end
+
+local VERSION = "0.2.0"
 local Config = {
 	mainDir = "UniversalDumper",
-    debug = false,
+	debug = false,
 	decompile = true,
 	dumpDebug = false,
 	detailedDebug = false,
@@ -53,19 +55,38 @@ local Config = {
 	postHttp = false,
 	httpSink = "",
 }
+local SERIAL_CAPS = {
+	stringMax = 4000,
+	depth = 8,
+	tableEntries = 300,
+	argCount = 12,
+}
 local IGNORED_ANCESTORS = { "Chat", "CoreGui", "CorePackages" }
 local IGNORED_NAMES = { "PlayerModule", "RbxCharacterSounds", "PlayerScriptsLoader", "ChatScript", "BubbleChat" }
-local SERVER_SERVICES = {
+local NONREPLICATED_CONTAINERS = {
 	"ServerScriptService",
 	"ServerStorage",
-	"Teams",
-	"MaterialService",
+}
+local NETWORK_REMOTE_CLASSES = {
+	RemoteEvent = true,
+	RemoteFunction = true,
+	UnreliableRemoteEvent = true,
+}
+local BINDABLE_CLASSES = {
+	BindableEvent = true,
+	BindableFunction = true,
 }
 local SCRIPT_CLASSES = {
 	LocalScript = true,
 	ModuleScript = true,
 	Script = true,
 }
+local REMOTE_PATTERNS = {
+	"InvokeServer%(%s*[\\\"']([^\\\"']+)[\\\"']",
+	"FireServer%(%s*[\\\"']([^\\\"']+)[\\\"']",
+	"OnClientEvent%(%s*[\\\"']([^\\\"']+)[\\\"']",
+}
+
 local function pickFn(...)
 	for i = 1, select("#", ...) do
 		local fn = select(i, ...)
@@ -88,6 +109,7 @@ local getLoadedModules = pickFn(typeof(getloadedmodules) == "function" and getlo
 local getBytecode = pickFn(typeof(getscriptbytecode) == "function" and getscriptbytecode, env and env.getscriptbytecode)
 local getConnections = pickFn(typeof(getconnections) == "function" and getconnections, env and env.getconnections)
 local hookMeta = pickFn(typeof(hookmetamethod) == "function" and hookmetamethod, env and env.hookmetamethod)
+local hookFn = pickFn(typeof(hookfunction) == "function" and hookfunction, env and env.hookfunction, typeof(hookfunc) == "function" and hookfunc)
 local getNamecall = pickFn(typeof(getnamecallmethod) == "function" and getnamecallmethod, env and env.getnamecallmethod)
 local checkCaller = pickFn(typeof(checkcaller) == "function" and checkcaller, env and env.checkcaller)
 local newClosure = pickFn(typeof(newcclosure) == "function" and newcclosure, env and env.newcclosure) or function(f)
@@ -101,23 +123,61 @@ local isFolder = pickFn(typeof(isfolder) == "function" and isfolder, env and env
 local httpRequest = pickFn(typeof(request) == "function" and request, typeof(http_request) == "function" and http_request, env and env.request)
 local appendFile = pickFn(typeof(appendfile) == "function" and appendfile, env and env.appendfile)
 local identifyExecutor = pickFn(typeof(identifyexecutor) == "function" and identifyexecutor, env and env.identifyexecutor)
+
+local Core = { running = true, connections = {}, namecallHook = nil, hookedMethods = {} }
+local DecompileCache = {}
+local ScriptsDumped = 0
+local TimedOut = {}
+local StaticRemoteRefs = {}
+local RemoteIndex = {}
+local ScriptSeen = {}
+local ScriptMeta = {}
+local HashUsed = {}
+local ScriptIndex = { totalFound = 0, dumped = 0, failed = 0, timedOut = 0, items = {} }
+local OUT = ""
+local WriteStats = { ok = 0, fail = 0, lastError = "" }
+local Log = { lines = {}, phase = "boot" }
+local DISK_ROOT = ""
+local Live = {
+	n = 0,
+	pending = {},
+	pendingNet = "",
+	recent = {},
+	fallbackFiles = {},
+	remotesHooked = {},
+	invokePrev = {},
+	invokeWrap = {},
+	lastFlush = os.clock(),
+	lastRewrap = os.clock(),
+	lastCatalogWrite = 0,
+	c2sGuard = 0,
+}
+
+local writeText
+local writeJson
+local log
+local toJsonSafe
+local serializeValue
+local serializeArg
+local serializeArgList
+local extractRemoteStrings
+local writePhase
+local flushLiveLogs
+local livePush
+local writeRemoteCatalog
+local dumpOneScript
+local observeRemoteCall
+local wrapOnClientInvoke
+local hookRemoteIncoming
+local ensureRemoteRecord
+
 local function trackConn(conn)
 	if conn then
 		table.insert(Core.connections, conn)
 	end
 	return conn
 end
-local Core = { running = true, connections = {} }
-local DecompileCache = {}
-local ScriptsDumped = 0
-local TimedOut = {}
-local RemoteCatalog = {}
-local OUT = ""
-local WriteStats = { ok = 0, fail = 0, lastError = "" }
-local Log = { lines = {}, phase = "boot" }
-local toJsonSafe
-local writePhase
-local extractRemoteStrings
+
 local function dbg(...)
 	if not Config.debug then
 		return
@@ -133,23 +193,7 @@ local function dbgWarn(...)
 		warn("[Dump]", ...)
 	end
 end
-local function log(kind, text)
-	local row = string.format("[%s] %s  %s", kind, Log.phase, text)
-	table.insert(Log.lines, row)
-	if Config.debug then
-		print("[Dump] " .. text)
-	end
-	dbg(kind, text)
-	if #Log.lines > 5000 then
-		table.remove(Log.lines, 1)
-	end
-	if writeFile and OUT ~= "" and (#Log.lines % 20 == 0) then
-		pcall(function()
-			writeText("log.txt", table.concat(Log.lines, "\n"))
-			writeText("progress.txt", Log.phase .. "\n" .. text)
-		end)
-	end
-end
+
 local function ensureDir(path)
 	if not makeFolder then
 		dbgWarn("makefolder API missing — writes may fail")
@@ -170,6 +214,7 @@ local function ensureDir(path)
 	end
 	return true
 end
+
 local function safePathSegment(text)
 	text = tostring(text or "unknown")
 	text = string.gsub(text, "[\\/:*?\"<>|\n\r]", " ")
@@ -179,7 +224,8 @@ local function safePathSegment(text)
 	end
 	return text
 end
-local function writeText(rel, text)
+
+writeText = function(rel, text)
 	if not writeFile then
 		WriteStats.fail += 1
 		WriteStats.lastError = "writefile API missing"
@@ -205,12 +251,6 @@ local function writeText(rel, text)
 		if Config.debug then
 			dbg("WROTE", full, "(" .. #tostring(text) .. " bytes)")
 		end
-		if readFile and Config.debug then
-			local rok, back = pcall(readFile, full)
-			if not rok or back ~= text then
-				dbgWarn("readback mismatch:", full, rok, back and #back or "nil")
-			end
-		end
 		return true
 	end
 	WriteStats.fail += 1
@@ -218,6 +258,7 @@ local function writeText(rel, text)
 	dbgWarn("WRITE FAILED:", full, err)
 	return false, err
 end
+
 local function jsonEncode(value)
 	local ok, encoded = pcall(function()
 		return HttpService:JSONEncode(value)
@@ -227,7 +268,8 @@ local function jsonEncode(value)
 	end
 	return nil, encoded
 end
-local function writeJson(rel, payload)
+
+writeJson = function(rel, payload)
 	local encoded, err = jsonEncode(payload)
 	if not encoded then
 		encoded, err = jsonEncode(toJsonSafe(payload))
@@ -242,7 +284,50 @@ local function writeJson(rel, payload)
 	end
 	return ok
 end
-local DISK_ROOT = ""
+
+local function appendText(rel, text)
+	if not text or text == "" then
+		return true
+	end
+	if OUT == "" then
+		return false, "OUT empty"
+	end
+	local dir = string.match(rel, "^(.*)/[^/]+$")
+	if dir then
+		ensureDir(OUT .. "/" .. dir)
+	else
+		ensureDir(OUT)
+	end
+	if appendFile then
+		local ok, err = pcall(appendFile, OUT .. "/" .. rel, text)
+		if ok then
+			WriteStats.ok += 1
+			return true
+		end
+		dbgWarn("appendfile failed:", rel, err)
+	end
+	Live.fallbackFiles[rel] = (Live.fallbackFiles[rel] or "") .. text
+	return writeText(rel, Live.fallbackFiles[rel])
+end
+
+log = function(kind, text)
+	local row = string.format("[%s] %s  %s", kind, Log.phase, text)
+	table.insert(Log.lines, row)
+	if Config.debug then
+		print("[Dump] " .. text)
+	end
+	dbg(kind, text)
+	if #Log.lines > 5000 then
+		table.remove(Log.lines, 1)
+	end
+	if writeFile and OUT ~= "" and (#Log.lines % 20 == 0) then
+		pcall(function()
+			writeText("log.txt", table.concat(Log.lines, "\n"))
+			writeText("progress.txt", Log.phase .. "\n" .. text)
+		end)
+	end
+end
+
 local function probeFilesystem()
 	dbg("=== FILESYSTEM PROBE ===")
 	dbg("writefile:", writeFile ~= nil)
@@ -275,9 +360,6 @@ local function probeFilesystem()
 		local lok, files = pcall(listFiles, Config.mainDir)
 		if lok and type(files) == "table" then
 			dbg("listfiles", Config.mainDir, "count=", #files)
-			for i = 1, math.min(5, #files) do
-				dbg(" ", files[i])
-			end
 		else
 			dbgWarn("listfiles failed:", files)
 		end
@@ -285,18 +367,21 @@ local function probeFilesystem()
 	dbg("disk root (Wave):", DISK_ROOT)
 	return true
 end
+
 local function instancePath(inst)
 	local ok, full = pcall(function()
 		return inst:GetFullName()
 	end)
 	return (ok and full ~= "") and full or tostring(inst)
 end
+
 local function replacePlayerName(text)
 	if not Config.replaceUsername then
 		return text
 	end
 	return string.gsub(text, LocalPlayer.Name, "LocalPlayer")
 end
+
 local function getFullNameForScript(inst)
 	local path = replacePlayerName(instancePath(inst))
 	local split = string.split(path, ".")
@@ -316,51 +401,271 @@ local function getFullNameForScript(inst)
 	end
 	return path
 end
-toJsonSafe = function(value, depth, seen)
+
+local function instanceUniqueId(inst)
+	local id = nil
+	pcall(function()
+		id = inst.UniqueId
+	end)
+	if type(id) == "string" and id ~= "" then
+		return id
+	end
+	pcall(function()
+		id = inst:GetDebugId()
+	end)
+	if type(id) == "string" and id ~= "" then
+		return id
+	end
+	return nil
+end
+
+local function fnv1aHex(s)
+	local h = 2166136261
+	for i = 1, #s do
+		h = bit32.bxor(h, string.byte(s, i))
+		h = bit32.mul(h, 16777619)
+	end
+	return string.format("%08x", h)
+end
+
+local function toHex(s)
+	return (string.gsub(s, ".", function(c)
+		return string.format("%02x", string.byte(c))
+	end))
+end
+
+--[=[ serializer ]=]
+local function serializeVector3(v)
+	return { type = "Vector3", x = v.X, y = v.Y, z = v.Z }
+end
+local function serializeVector2(v)
+	return { type = "Vector2", x = v.X, y = v.Y }
+end
+local function serializeColor3(v)
+	return { type = "Color3", r = v.R, g = v.G, b = v.B }
+end
+
+serializeValue = function(value, depth, seen, trunc)
 	depth = depth or 0
-	if depth > 8 then
-		return "…"
+	seen = seen or {}
+	trunc = trunc or {}
+	if depth > SERIAL_CAPS.depth then
+		trunc.depth = true
+		return { type = "truncated", reason = "depth" }
 	end
 	local t = typeof(value)
 	if t == "nil" then
-		return nil
+		return { type = "nil" }
 	elseif t == "boolean" or t == "number" then
 		return value
 	elseif t == "string" then
-		if #value > 4000 then
-			value = string.sub(value, 1, 4000) .. "…"
+		if #value > SERIAL_CAPS.stringMax then
+			trunc.stringMax = (trunc.stringMax or 0) + 1
+			value = string.sub(value, 1, SERIAL_CAPS.stringMax) .. "…"
 		end
 		return string.gsub(value, "[\0-\31]", "")
 	elseif t == "Instance" then
-		return { __instance = replacePlayerName(instancePath(value)), class = value.ClassName }
-	elseif t == "Vector3" or t == "Vector2" or t == "CFrame" or t == "Color3" then
-		return tostring(value)
+		return {
+			type = "Instance",
+			class = value.ClassName,
+			name = value.Name,
+			path = replacePlayerName(instancePath(value)),
+			uniqueId = instanceUniqueId(value),
+		}
+	elseif t == "Vector3" then
+		return serializeVector3(value)
+	elseif t == "Vector2" then
+		return serializeVector2(value)
+	elseif t == "Vector3int16" then
+		return { type = "Vector3int16", x = value.X, y = value.Y, z = value.Z }
+	elseif t == "Vector2int16" then
+		return { type = "Vector2int16", x = value.X, y = value.Y }
+	elseif t == "CFrame" then
+		local x, y, z, r00, r01, r02, r10, r11, r12, r20, r21, r22 = value:GetComponents()
+		return {
+			type = "CFrame",
+			x = x,
+			y = y,
+			z = z,
+			r00 = r00,
+			r01 = r01,
+			r02 = r02,
+			r10 = r10,
+			r11 = r11,
+			r12 = r12,
+			r20 = r20,
+			r21 = r21,
+			r22 = r22,
+		}
+	elseif t == "Color3" then
+		return serializeColor3(value)
+	elseif t == "EnumItem" then
+		return {
+			type = "EnumItem",
+			enum = tostring(value.EnumType),
+			name = value.Name,
+			value = value.Value,
+		}
+	elseif t == "UDim" then
+		return { type = "UDim", scale = value.Scale, offset = value.Offset }
+	elseif t == "UDim2" then
+		return {
+			type = "UDim2",
+			x = { scale = value.X.Scale, offset = value.X.Offset },
+			y = { scale = value.Y.Scale, offset = value.Y.Offset },
+		}
+	elseif t == "Ray" then
+		return {
+			type = "Ray",
+			origin = serializeVector3(value.Origin),
+			direction = serializeVector3(value.Direction),
+		}
+	elseif t == "BrickColor" then
+		return { type = "BrickColor", name = value.Name, number = value.Number }
+	elseif t == "NumberRange" then
+		return { type = "NumberRange", min = value.Min, max = value.Max }
+	elseif t == "NumberSequence" then
+		local keys = {}
+		for i, kp in ipairs(value.Keypoints) do
+			keys[i] = { time = kp.Time, value = kp.Value, envelope = kp.Envelope }
+		end
+		return { type = "NumberSequence", keypoints = keys }
+	elseif t == "ColorSequence" then
+		local keys = {}
+		for i, kp in ipairs(value.Keypoints) do
+			keys[i] = { time = kp.Time, value = serializeColor3(kp.Value) }
+		end
+		return { type = "ColorSequence", keypoints = keys }
+	elseif t == "Rect" then
+		return {
+			type = "Rect",
+			min = serializeVector2(value.Min),
+			max = serializeVector2(value.Max),
+			width = value.Width,
+			height = value.Height,
+		}
+	elseif t == "PhysicalProperties" then
+		local row = {
+			type = "PhysicalProperties",
+			density = value.Density,
+			friction = value.Friction,
+			elasticity = value.Elasticity,
+			frictionWeight = value.FrictionWeight,
+			elasticityWeight = value.ElasticityWeight,
+		}
+		pcall(function()
+			row.acousticAbsorption = value.AcousticAbsorption
+		end)
+		return row
 	elseif t == "table" then
-		seen = seen or {}
 		if seen[value] then
-			return { __cycle = true }
+			return { type = "cycle" }
 		end
 		seen[value] = true
 		local out = {}
 		local n = 0
 		for k, v in pairs(value) do
 			n += 1
-			if n > 300 then
+			if n > SERIAL_CAPS.tableEntries then
+				trunc.tableEntries = true
 				out.__truncated = true
 				break
 			end
 			local key = typeof(k) == "string" and k or tostring(k)
-			out[key] = toJsonSafe(v, depth + 1, seen)
+			out[key] = serializeValue(v, depth + 1, seen, trunc)
 		end
-		return out
+		return { type = "table", value = out }
 	end
-	return tostring(value)
+	return { type = t, value = tostring(value) }
 end
-local REMOTE_PATTERNS = {
-	"InvokeServer%(%s*[\\\"']([^\\\"']+)[\\\"']",
-	"FireServer%(%s*[\\\"']([^\\\"']+)[\\\"']",
-	"OnClientEvent%(%s*[\\\"']([^\\\"']+)[\\\"']",
-}
+
+toJsonSafe = function(value, depth, seen)
+	return serializeValue(value, depth, seen, {})
+end
+
+local function compactValue(ser)
+	if ser == nil then
+		return "nil"
+	end
+	local ty = typeof(ser)
+	if ty == "boolean" or ty == "number" then
+		return tostring(ser)
+	elseif ty == "string" then
+		if #ser > 80 then
+			return string.format("%q", string.sub(ser, 1, 80) .. "…")
+		end
+		return string.format("%q", ser)
+	elseif ty ~= "table" then
+		return tostring(ser)
+	end
+	local t = ser.type
+	if t == "nil" then
+		return "nil"
+	elseif t == "truncated" then
+		return "…"
+	elseif t == "cycle" then
+		return "{cycle}"
+	elseif t == "Instance" then
+		return (ser.class or "Instance") .. ":" .. (ser.path or ser.name or "?")
+	elseif t == "Vector3" then
+		return string.format("Vector3(%.5g,%.5g,%.5g)", ser.x, ser.y, ser.z)
+	elseif t == "Vector2" then
+		return string.format("Vector2(%.5g,%.5g)", ser.x, ser.y)
+	elseif t == "CFrame" then
+		return string.format("CFrame(%.5g,%.5g,%.5g)", ser.x, ser.y, ser.z)
+	elseif t == "Color3" then
+		return string.format("Color3(%.5g,%.5g,%.5g)", ser.r, ser.g, ser.b)
+	elseif t == "EnumItem" then
+		return tostring(ser.enum) .. "." .. tostring(ser.name)
+	elseif t == "table" then
+		return "{…}"
+	elseif t then
+		return t
+	end
+	return "?"
+end
+
+serializeArg = function(value)
+	local trunc = {}
+	local ser = serializeValue(value, 0, {}, trunc)
+	return ser, trunc
+end
+
+serializeArgList = function(args, n)
+	n = n or #args
+	local trunc = {}
+	local max = SERIAL_CAPS.argCount
+	local out = {}
+	for i = 1, math.min(n, max) do
+		local ser, t = serializeArg(args[i])
+		out[i] = ser
+		if t.depth then
+			trunc.depth = true
+		end
+		if t.stringMax then
+			trunc.stringMax = true
+		end
+		if t.tableEntries then
+			trunc.tableEntries = true
+		end
+	end
+	if n > max then
+		trunc.argCount = n - max
+	end
+	local parts = {}
+	for i = 1, #out do
+		parts[i] = compactValue(out[i])
+	end
+	if trunc.argCount then
+		table.insert(parts, "…+" .. trunc.argCount)
+	end
+	local types = {}
+	for i = 1, math.min(n, max) do
+		types[i] = typeof(args[i])
+	end
+	return out, trunc, table.concat(parts, ", "), types
+end
+
 writePhase = function(name, extra)
 	if OUT == "" then
 		return
@@ -376,17 +681,19 @@ writePhase = function(name, extra)
 	))
 	dbg("PHASE", name, extra or "")
 end
+
 extractRemoteStrings = function(source, scriptPath)
 	if type(source) ~= "string" then
 		return
 	end
 	for _, pattern in ipairs(REMOTE_PATTERNS) do
 		for match in string.gmatch(source, pattern) do
-			RemoteCatalog[match] = RemoteCatalog[match] or {}
-			table.insert(RemoteCatalog[match], scriptPath)
+			StaticRemoteRefs[match] = StaticRemoteRefs[match] or {}
+			table.insert(StaticRemoteRefs[match], scriptPath)
 		end
 	end
 end
+
 local function isIgnored(inst)
 	if not Config.skipCore then
 		return false
@@ -404,9 +711,15 @@ local function isIgnored(inst)
 	end
 	return false
 end
+
 local function isScript(inst)
 	return typeof(inst) == "Instance" and SCRIPT_CLASSES[inst.ClassName] == true
 end
+
+local function isNetworkRemote(inst)
+	return typeof(inst) == "Instance" and NETWORK_REMOTE_CLASSES[inst.ClassName] == true
+end
+
 local function addScript(set, list, inst, sourceTag)
 	if not isScript(inst) or isIgnored(inst) then
 		return
@@ -424,6 +737,7 @@ local function addScript(set, list, inst, sourceTag)
 		isNil = not inst:IsDescendantOf(game),
 	})
 end
+
 local function collectAllScripts()
 	local set = {}
 	local list = {}
@@ -453,25 +767,24 @@ local function collectAllScripts()
 			end
 		end
 	end
-	for _, serviceName in ipairs(SERVER_SERVICES) do
-		pcall(function()
-			local svc = game:GetService(serviceName)
-			for _, inst in ipairs(svc:GetDescendants()) do
-				addScript(set, list, inst, "server:" .. serviceName)
-			end
-		end)
-	end
 	return list
 end
-local function probeServerContainers()
+
+local function probeNonReplicatedContainers()
 	local rows = {}
-	for _, serviceName in ipairs(SERVER_SERVICES) do
-		local row = { service = serviceName, accessible = false, scripts = 0, instances = 0, note = "" }
+	for _, serviceName in ipairs(NONREPLICATED_CONTAINERS) do
+		local row = {
+			service = serviceName,
+			accessible = false,
+			scripts = 0,
+			instances = 0,
+			note = "diagnostic only — not a server dump",
+		}
 		local ok, svc = pcall(function()
 			return game:GetService(serviceName)
 		end)
 		if not ok or not svc then
-			row.note = "GetService failed"
+			row.note = "GetService failed (still not a server dump)"
 			table.insert(rows, row)
 			continue
 		end
@@ -486,14 +799,19 @@ local function probeServerContainers()
 					row.scripts += 1
 				end
 			end
-			row.note = row.instances > 0 and "visible to client" or "empty or filtered"
+			if row.instances > 0 then
+				row.note = "some instances visible to this client; unreplicated source is still unavailable"
+			else
+				row.note = "empty or filtered from the client — expected"
+			end
 		else
-			row.note = "GetDescendants blocked"
+			row.note = "GetDescendants blocked from client — expected"
 		end
 		table.insert(rows, row)
 	end
 	return rows
 end
+
 local function decompileScript(scriptInst)
 	if not decompileFn then
 		return nil, "no decompiler"
@@ -518,6 +836,10 @@ local function decompileScript(scriptInst)
 			end)
 			if bok and bytecode then
 				output = "-- bytecode fallback\n" .. tostring(bytecode)
+				if hash then
+					DecompileCache[hash] = output
+				end
+				return output, "bytecode"
 			end
 		end
 	end
@@ -529,7 +851,60 @@ local function decompileScript(scriptInst)
 	end
 	return output, "decompiled"
 end
-local function buildDebugBlock(scriptInst, source)
+
+local function assessConfidence(scriptInst, source, status)
+	local syntax = "n/a"
+	local constCount, protoCount = nil, nil
+	if status == "decompiled" or status == "cache" then
+		local loadFn = loadstring or load
+		if type(loadFn) == "function" and type(source) == "string" then
+			local okLoad = pcall(loadFn, source)
+			syntax = okLoad and "valid" or "invalid"
+		else
+			syntax = "unknown"
+		end
+	end
+	if getScriptClosure then
+		local ok, closure = pcall(getScriptClosure, scriptInst)
+		if ok and type(closure) == "function" then
+			if getConstants then
+				local cok, constants = pcall(getConstants, closure)
+				if cok and type(constants) == "table" then
+					constCount = #constants
+				end
+			end
+			if getProtos then
+				local pok, protos = pcall(getProtos, closure)
+				if pok and type(protos) == "table" then
+					protoCount = #protos
+				end
+			end
+		end
+	end
+	local confidence = "low"
+	if status == "decompiled" or status == "cache" then
+		if syntax == "valid" then
+			confidence = "high"
+		elseif syntax == "invalid" then
+			confidence = "low"
+		else
+			confidence = "medium"
+		end
+	elseif status == "bytecode" then
+		confidence = "low"
+	elseif status == "timeout" or status == "decompile failed" then
+		confidence = "low"
+	end
+	return {
+		decompile = status,
+		syntax = syntax,
+		constants = constCount,
+		protos = protoCount,
+		confidence = confidence,
+	}
+end
+
+local function buildDebugBlock(scriptInst)
 	if not Config.dumpDebug then
 		return ""
 	end
@@ -566,124 +941,320 @@ local function buildDebugBlock(scriptInst, source)
 	end
 	return table.concat(lines, "\n")
 end
-local function scriptFileName(index, entry)
-	local short = safePathSegment(entry.path)
-	if #short > 90 then
-		short = string.sub(short, 1, 45) .. ".." .. string.sub(short, -40)
+
+local function contentHash(scriptInst, source)
+	local raw = nil
+	if getScriptHash then
+		pcall(function()
+			raw = getScriptHash(scriptInst)
+		end)
 	end
-	return string.format("scripts/%04d_%s.lua", index, short)
+	if type(raw) == "string" and raw ~= "" then
+		if string.match(raw, "^[0-9a-fA-F]+$") then
+			return string.lower(raw)
+		end
+		if #raw <= 64 then
+			return toHex(raw)
+		end
+		return fnv1aHex(raw)
+	end
+	return "src_" .. fnv1aHex(tostring(source or "") .. "\0" .. instancePath(scriptInst))
 end
+
+local function scriptFileName(hash, path)
+	local key = hash
+	if HashUsed[key] and HashUsed[key] ~= path then
+		key = hash .. "_" .. fnv1aHex(path)
+	end
+	HashUsed[key] = path
+	return "scripts/" .. safePathSegment(key) .. ".lua", key
+end
+
+local function writeScriptMetadata()
+	ensureDir(OUT .. "/metadata")
+	writeJson("metadata/scripts.json", {
+		count = #ScriptMeta,
+		items = ScriptMeta,
+	})
+	writeJson("scripts-index.json", ScriptIndex)
+end
+
+dumpOneScript = function(entry)
+	local item = {
+		path = entry.path,
+		class = entry.class,
+		source = entry.source,
+		isNil = entry.isNil,
+		replicatedScriptClass = entry.class == "Script",
+	}
+	local ok, err = pcall(function()
+		local scriptInst = entry.script
+		local started = os.clock()
+		local source = "-- decompile disabled"
+		local status = "skipped"
+		if Config.decompile and decompileFn then
+			while (os.clock() - started) < Config.timeout do
+				local output, mode = decompileScript(scriptInst)
+				if output then
+					source = output
+					status = mode
+					break
+				end
+				task.wait(0.15)
+			end
+			if status == "skipped" then
+				status = "timeout"
+				source = "-- Decompilation timed out after " .. Config.timeout .. "s"
+				table.insert(TimedOut, entry.path)
+				ScriptIndex.timedOut += 1
+			end
+		elseif Config.includeBytecode and getBytecode then
+			local bok, bc = pcall(getBytecode, scriptInst)
+			if bok and bc then
+				source = "-- bytecode only\n" .. tostring(bc)
+				status = "bytecode"
+			end
+		end
+		local assess = assessConfidence(scriptInst, source, status)
+		local hash = contentHash(scriptInst, source)
+		local relPath, storedHash = scriptFileName(hash, entry.path)
+		local header = string.format(
+			"-- name: %s\n-- path: %s\n-- class: %s\n-- collected: %s\n-- decompile: %s\n-- syntax: %s\n-- constants: %s\n-- protos: %s\n-- confidence: %s\n-- hash: %s\n-- elapsed: %.3fs\n\n%s%s",
+			tostring(scriptInst.Name),
+			getFullNameForScript(scriptInst),
+			entry.class,
+			entry.source,
+			assess.decompile,
+			assess.syntax,
+			tostring(assess.constants),
+			tostring(assess.protos),
+			assess.confidence,
+			storedHash,
+			os.clock() - started,
+			source,
+			buildDebugBlock(scriptInst)
+		)
+		extractRemoteStrings(source, entry.path)
+		if writeText(relPath, header) then
+			item.file = relPath
+			item.hash = storedHash
+			item.status = status
+			item.syntax = assess.syntax
+			item.confidence = assess.confidence
+			item.constants = assess.constants
+			item.protos = assess.protos
+			item.firstSeen = os.time()
+			ScriptsDumped += 1
+			table.insert(ScriptMeta, {
+				path = replacePlayerName(entry.path),
+				class = entry.class,
+				hash = storedHash,
+				file = relPath,
+				collected = entry.source,
+				first_seen = os.time(),
+				last_seen = os.time(),
+				decompile = assess.decompile,
+				syntax = assess.syntax,
+				constants = assess.constants,
+				protos = assess.protos,
+				confidence = assess.confidence,
+				isNil = entry.isNil,
+			})
+		else
+			item.status = "write_failed"
+			ScriptIndex.failed += 1
+		end
+	end)
+	if not ok then
+		item.error = tostring(err)
+		item.status = "error"
+		ScriptIndex.failed += 1
+		dbgWarn("script error", entry.path, err)
+	end
+	table.insert(ScriptIndex.items, item)
+	ScriptSeen[entry.path] = true
+	return item
+end
+
 local function dumpAllScripts(scriptList)
 	Log.phase = "scripts"
 	local total = math.min(#scriptList, Config.maxScripts)
+	ScriptIndex.totalFound = #scriptList
 	log("boot", string.format("decompiling %d / %d scripts (sequential)", total, #scriptList))
 	ensureDir(OUT .. "/scripts")
+	ensureDir(OUT .. "/metadata")
 	writePhase("scripts_start", "total=" .. total)
-	local index = { totalFound = #scriptList, dumped = 0, failed = 0, timedOut = 0, items = {} }
 	for i = 1, total do
 		local entry = scriptList[i]
-		local item = {
-			path = entry.path,
-			class = entry.class,
-			source = entry.source,
-			isNil = entry.isNil,
-			isServerScript = entry.class == "Script",
-		}
-		local ok, err = pcall(function()
-			local scriptInst = entry.script
-			local relPath = scriptFileName(i, entry)
-			local started = os.clock()
-			local source = "-- decompile disabled"
-			local status = "skipped"
-			if Config.decompile and decompileFn then
-				while (os.clock() - started) < Config.timeout do
-					local output, mode = decompileScript(scriptInst)
-					if output then
-						source = output
-						status = mode
-						break
-					end
-					task.wait(0.15)
-				end
-				if status == "skipped" then
-					status = "timeout"
-					source = "-- Decompilation timed out after " .. Config.timeout .. "s"
-					table.insert(TimedOut, entry.path)
-					index.timedOut += 1
-				end
-			elseif Config.includeBytecode and getBytecode then
-				local bok, bc = pcall(getBytecode, scriptInst)
-				if bok and bc then
-					source = "-- bytecode only\n" .. tostring(bc)
-					status = "bytecode"
-				end
-			end
-			local header = string.format(
-				[[
-%s]],
-				tostring(scriptInst.Name),
-				getFullNameForScript(scriptInst),
-				entry.class,
-				entry.source,
-				status,
-				os.clock() - started,
-				source
-			)
-			extractRemoteStrings(source, entry.path)
-			if writeText(relPath, header) then
-				item.file = relPath
-				item.status = status
-				ScriptsDumped += 1
-			else
-				item.status = "write_failed"
-				index.failed += 1
-			end
-		end)
-		if not ok then
-			item.error = tostring(err)
-			item.status = "error"
-			index.failed += 1
-			dbgWarn("script error", i, entry.path, err)
-		end
-		table.insert(index.items, item)
+		dumpOneScript(entry)
 		if i % 3 == 0 or i == total then
-			log("prog", string.format("scripts %d/%d dumped=%d fail=%d", i, total, ScriptsDumped, index.failed))
+			log("prog", string.format("scripts %d/%d dumped=%d fail=%d", i, total, ScriptsDumped, ScriptIndex.failed))
 			writePhase("scripts", string.format("%d/%d last=%s", i, total, entry.path))
 		end
 		if i % 15 == 0 then
 			task.wait()
 		end
 	end
-	index.dumped = ScriptsDumped
-	writeJson("scripts-index.json", index)
+	ScriptIndex.dumped = ScriptsDumped
+	writeScriptMetadata()
 	if #TimedOut > 0 then
 		writeText("timed-out-scripts.txt", table.concat(TimedOut, "\n"))
 	end
-	log("done", string.format("scripts dumped=%d failed=%d timedOut=%d", ScriptsDumped, index.failed, index.timedOut))
-	writePhase("scripts_done", string.format("dumped=%d fail=%d", ScriptsDumped, index.failed))
+	log("done", string.format("scripts dumped=%d failed=%d timedOut=%d", ScriptsDumped, ScriptIndex.failed, ScriptIndex.timedOut))
+	writePhase("scripts_done", string.format("dumped=%d fail=%d", ScriptsDumped, ScriptIndex.failed))
 end
+
+local function readTags(inst)
+	local tags = nil
+	pcall(function()
+		tags = inst:GetTags()
+	end)
+	if type(tags) == "table" and #tags > 0 then
+		return tags
+	end
+	return nil
+end
+
+local function readAttributes(inst)
+	if not Config.dumpAttributes then
+		return nil
+	end
+	local attrs = nil
+	pcall(function()
+		attrs = inst:GetAttributes()
+	end)
+	if type(attrs) == "table" and next(attrs) then
+		return serializeValue(attrs)
+	end
+	return nil
+end
+
+ensureRemoteRecord = function(inst)
+	if typeof(inst) ~= "Instance" then
+		return nil
+	end
+	local path = replacePlayerName(instancePath(inst))
+	local rec = RemoteIndex[path]
+	if rec then
+		rec.last_seen = os.time()
+		return rec
+	end
+	local className = inst.ClassName
+	local channel = BINDABLE_CLASSES[className] and "bindable" or "network"
+	rec = {
+		path = path,
+		class = className,
+		name = inst.Name,
+		attributes = readAttributes(inst),
+		tags = readTags(inst),
+		channel = channel,
+		refs = { instance = true, static = {}, runtime = false },
+		stats = { c2s = 0, s2c = 0, firstSeen = os.time(), lastSeen = os.time() },
+		argSchema = {},
+	}
+	RemoteIndex[path] = rec
+	return rec
+end
+
+observeRemoteCall = function(path, className, dir, argTypes)
+	local rec = RemoteIndex[path]
+	if not rec then
+		rec = {
+			path = path,
+			class = className or "Remote",
+			name = string.match(path, "[^%.]+$") or path,
+			channel = "network",
+			refs = { instance = false, static = {}, runtime = true },
+			stats = { c2s = 0, s2c = 0, firstSeen = os.time(), lastSeen = os.time() },
+			argSchema = {},
+		}
+		RemoteIndex[path] = rec
+	end
+	rec.refs.runtime = true
+	rec.stats.lastSeen = os.time()
+	if not rec.stats.firstSeen then
+		rec.stats.firstSeen = os.time()
+	end
+	if dir == "C2S" then
+		rec.stats.c2s += 1
+	elseif dir == "S2C" then
+		rec.stats.s2c += 1
+	end
+	if type(argTypes) == "table" and #argTypes > 0 then
+		rec.argSchema = argTypes
+	end
+end
+
+writeRemoteCatalog = function()
+	local items = {}
+	for path, rec in pairs(RemoteIndex) do
+		table.insert(items, rec)
+	end
+	table.sort(items, function(a, b)
+		return a.path < b.path
+	end)
+	local nameHits = {}
+	for name, scripts in pairs(StaticRemoteRefs) do
+		nameHits[name] = scripts
+	end
+	for _, rec in ipairs(items) do
+		local scripts = nameHits[rec.name]
+		if scripts then
+			rec.refs.static = scripts
+			nameHits[rec.name] = nil
+		end
+	end
+	for name, scripts in pairs(nameHits) do
+		table.insert(items, {
+			path = name,
+			class = "Unknown",
+			name = name,
+			channel = "static-only",
+			refs = { instance = false, static = scripts, runtime = false },
+			stats = { c2s = 0, s2c = 0 },
+			argSchema = {},
+			note = "regex match only — no RemoteEvent/RemoteFunction instance with this name was found",
+		})
+	end
+	table.sort(items, function(a, b)
+		return a.path < b.path
+	end)
+	writeJson("remote-catalog.json", {
+		note = "Instance-first remote index. refs.static is regex-on-source (one signal, not the catalog). Bindables are channel=bindable.",
+		count = #items,
+		items = items,
+	})
+	Live.lastCatalogWrite = os.clock()
+end
+
 local function dumpRemotes()
 	Log.phase = "remotes"
 	local all = {}
 	for _, inst in ipairs(game:GetDescendants()) do
 		local className = inst.ClassName
-		if className == "RemoteEvent" or className == "RemoteFunction"
-			or className == "UnreliableRemoteEvent"
-			or className == "BindableEvent" or className == "BindableFunction"
-		then
+		if NETWORK_REMOTE_CLASSES[className] or BINDABLE_CLASSES[className] then
+			local rec = ensureRemoteRecord(inst)
 			table.insert(all, {
 				class = className,
-				path = replacePlayerName(instancePath(inst)),
-				name = inst.Name,
+				path = rec.path,
+				name = rec.name,
+				channel = rec.channel,
+				attributes = rec.attributes,
+				tags = rec.tags,
 			})
 		end
 	end
 	table.sort(all, function(a, b)
 		return a.path < b.path
 	end)
-	writeJson("remotes-all.json", { count = #all, items = all })
+	writeJson("remotes-all.json", {
+		count = #all,
+		items = all,
+		note = "channel=network are remotes; channel=bindable are client-local.",
+	})
 	log("done", "remotes=" .. #all)
 end
+
 local function dumpValues()
 	Log.phase = "values"
 	local rows = {}
@@ -698,7 +1269,7 @@ local function dumpValues()
 						name = inst.Name,
 					}
 					pcall(function()
-						row.value = tostring(inst.Value)
+						row.value = serializeValue(inst.Value)
 					end)
 					table.insert(rows, row)
 				elseif Config.dumpAttributes then
@@ -707,7 +1278,7 @@ local function dumpValues()
 						table.insert(rows, {
 							path = replacePlayerName(instancePath(inst)),
 							class = inst.ClassName,
-							attributes = toJsonSafe(attrs),
+							attributes = serializeValue(attrs),
 						})
 					end
 				end
@@ -717,6 +1288,7 @@ local function dumpValues()
 	writeJson("values-all.json", { count = #rows, items = rows })
 	log("done", "values=" .. #rows)
 end
+
 local function dumpGui()
 	Log.phase = "gui"
 	local rows = {}
@@ -750,6 +1322,7 @@ local function dumpGui()
 	writeJson("gui-full.json", { count = #rows, items = rows })
 	log("done", "gui=" .. #rows)
 end
+
 local function dumpTree(root, label)
 	local rows = {}
 	local n = 0
@@ -768,13 +1341,13 @@ local function dumpTree(root, label)
 		}
 		if inst:IsA("ValueBase") then
 			pcall(function()
-				row.value = tostring(inst.Value)
+				row.value = serializeValue(inst.Value)
 			end)
 		end
 		if Config.dumpAttributes then
 			local attrs = inst:GetAttributes()
 			if attrs and next(attrs) then
-				row.attributes = toJsonSafe(attrs)
+				row.attributes = serializeValue(attrs)
 			end
 		end
 		table.insert(rows, row)
@@ -782,6 +1355,7 @@ local function dumpTree(root, label)
 	writeJson("trees/" .. label .. ".json", { root = label, count = #rows, items = rows })
 	log("done", "tree " .. label .. "=" .. #rows)
 end
+
 local function dumpTrees()
 	Log.phase = "trees"
 	ensureDir(OUT .. "/trees")
@@ -800,156 +1374,273 @@ local function dumpTrees()
 		end
 	end
 end
-local function buildRemoteCatalog()
-	Log.phase = "catalog"
-	local items = {}
-	for name, paths in pairs(RemoteCatalog) do
-		table.insert(items, { name = name, scripts = paths })
-	end
-	table.sort(items, function(a, b)
-		return a.name < b.name
-	end)
-	writeJson("remote-catalog.json", { count = #items, items = items })
-	log("done", "remote catalog=" .. #items)
-end
-local Live = {
-	n = 0,
-	netBuf = "",
-	jsonBuf = {},
-	remotesHooked = {},
-	lastFlush = os.clock(),
-}
-local function serializeArgs(args, max)
-	max = max or 12
-	local parts = {}
-	for i = 1, math.min(#args, max) do
-		parts[i] = serializeArg(args[i])
-	end
-	if #args > max then
-		table.insert(parts, "…+" .. (#args - max))
-	end
-	return table.concat(parts, ", ")
-end
-local function livePush(event)
+
+--[=[ live intercept ]=]
+livePush = function(event)
 	if not Core.running or not Config.liveIntercept then
 		return
 	end
 	Live.n += 1
-	event.n = Live.n
+	event.seq = Live.n
 	event.t = os.time()
 	event.clock = os.clock()
+	if not event.thread then
+		event.thread = tostring(coroutine.running())
+	end
 	local dir = event.dir or "?"
-	local kind = event.kind or "?"
+	local method = event.method or event.kind or "?"
+	event.method = method
+	event.kind = method
 	local target = event.remote or event.name or event.path or "?"
-	local argsText = event.argsText or event.retText or ""
-	Live.netBuf ..= string.format(
+	local argsText = event.argsText or ""
+	local line = string.format(
 		"%d\t%s\t%s\t%s\t%s\n",
 		Live.n,
 		os.date("%H:%M:%S", event.t),
-		dir .. ":" .. kind,
+		dir .. ":" .. method,
 		target,
 		argsText
 	)
-	table.insert(Live.jsonBuf, event)
-	if #Live.jsonBuf > 500 then
-		table.remove(Live.jsonBuf, 1)
+	table.insert(Live.pending, event)
+	Live.pendingNet ..= line
+	table.insert(Live.recent, event)
+	if #Live.recent > 500 then
+		table.remove(Live.recent, 1)
 	end
 	if Config.liveConsole or (Config.debug and Live.n <= 30) then
-		dbg("LIVE", dir, kind, target, argsText)
+		dbg("LIVE", dir, method, target, argsText)
 	end
 	if Live.n % Config.liveFlushEvery == 0 then
 		pcall(flushLiveLogs)
 	end
 end
-function flushLiveLogs()
+
+flushLiveLogs = function()
 	if OUT == "" or not writeFile then
 		return
 	end
 	ensureDir(OUT .. "/live")
-	if Live.netBuf ~= "" then
-		writeText("live/net.log", Live.netBuf)
-		writeText("net-live.log", Live.netBuf)
+	local pending = Live.pending
+	local pendingNet = Live.pendingNet
+	local flushed = 0
+	if pendingNet ~= "" then
+		local okNet = appendText("live/net.log", pendingNet)
+		local okLive = appendText("net-live.log", pendingNet)
+		if okNet or okLive then
+			Live.pendingNet = ""
+		end
 	end
-	if #Live.jsonBuf > 0 then
+	if #pending > 0 then
 		local lines = {}
-		for _, ev in ipairs(Live.jsonBuf) do
-			local line = jsonEncode(toJsonSafe(ev))
+		for _, ev in ipairs(pending) do
+			local line = jsonEncode(ev)
+			if not line then
+				line = jsonEncode(toJsonSafe(ev))
+			end
 			if line then
 				table.insert(lines, line)
 			end
 		end
-		if appendFile then
-			for _, line in ipairs(lines) do
-				pcall(appendFile, OUT .. "/live/events.jsonl", line .. "\n")
-			end
-		else
-			writeText("live/events.jsonl", table.concat(lines, "\n") .. "\n")
+		if #lines == 0 or appendText("live/events.jsonl", table.concat(lines, "\n") .. "\n") then
+			flushed = #pending
+			Live.pending = {}
 		end
+	end
+	local hooked = 0
+	for _ in pairs(Live.remotesHooked) do
+		hooked += 1
 	end
 	writeJson("live/status.json", {
 		at = os.time(),
 		events = Live.n,
-		remotesHooked = Live.remotesHooked,
+		remotesHooked = hooked,
+		pendingFlushed = flushed,
 		running = Core.running,
-		note = "Live intercept active — play the game, logs update in real time",
+		note = "Pending queue is cleared after each successful flush. recent[] is UI-only.",
 	})
+	if os.clock() - Live.lastCatalogWrite > 5 then
+		pcall(writeRemoteCatalog)
+	end
 	Live.lastFlush = os.clock()
 end
-local function hookRemoteIncoming(remote)
+
+local function pushRemoteEvent(dir, method, remote, args, n, returns, retN, source)
+	local path = "?"
+	local className = nil
+	pcall(function()
+		path = replacePlayerName(instancePath(remote))
+		className = remote.ClassName
+	end)
+	local argsSer, trunc, argsText, argTypes = serializeArgList(args, n)
+	local retSer, retTrunc, retText = nil, nil, nil
+	if returns then
+		retSer, retTrunc, retText = serializeArgList(returns, retN)
+		if retTrunc and retTrunc.argCount then
+			trunc = trunc or {}
+			trunc.returns = retTrunc
+		end
+	end
+	if next(trunc) == nil then
+		trunc = nil
+	end
+	observeRemoteCall(path, className, dir, argTypes)
+	livePush({
+		dir = dir,
+		method = method,
+		source = source,
+		remote = path,
+		class = className,
+		args = argsSer,
+		returns = retSer,
+		argsText = argsText,
+		retText = retText,
+		truncated = trunc,
+		thread = tostring(coroutine.running()),
+	})
+end
+
+wrapOnClientInvoke = function(remote)
+	if not Config.liveIntercept or not remote or not remote:IsA("RemoteFunction") then
+		return
+	end
+	local existing = nil
+	pcall(function()
+		existing = remote.OnClientInvoke
+	end)
+	if Live.invokeWrap[remote] and existing == Live.invokeWrap[remote] then
+		return
+	end
+	local prev = existing
+	if prev and prev == Live.invokeWrap[remote] then
+		prev = Live.invokePrev[remote]
+	end
+	Live.invokePrev[remote] = prev
+	local wrap
+	wrap = function(...)
+		local n = select("#", ...)
+		local args = { ... }
+		if not prev then
+			task.defer(function()
+				pushRemoteEvent("S2C", "OnClientInvoke", remote, args, n, nil, nil, "OnClientInvoke")
+			end)
+			return
+		end
+		local packed = table.pack(pcall(prev, ...))
+		if packed[1] then
+			local results = { table.unpack(packed, 2, packed.n) }
+			local retN = packed.n - 1
+			task.defer(function()
+				pushRemoteEvent("S2C", "OnClientInvoke", remote, args, n, results, retN, "OnClientInvoke")
+			end)
+			return table.unpack(packed, 2, packed.n)
+		end
+		task.defer(function()
+			pushRemoteEvent("S2C", "OnClientInvoke", remote, args, n, nil, nil, "OnClientInvoke")
+		end)
+		error(packed[2], 0)
+	end
+	Live.invokeWrap[remote] = wrap
+	pcall(function()
+		remote.OnClientInvoke = wrap
+	end)
+end
+
+hookRemoteIncoming = function(remote)
 	if not Config.liveIntercept or Live.remotesHooked[remote] then
 		return
 	end
 	Live.remotesHooked[remote] = true
+	ensureRemoteRecord(remote)
 	if remote:IsA("RemoteEvent") or remote:IsA("UnreliableRemoteEvent") then
 		trackConn(remote.OnClientEvent:Connect(function(...)
+			local n = select("#", ...)
 			local args = { ... }
 			task.defer(function()
-				livePush({
-					dir = "S2C",
-					kind = "OnClientEvent",
-					remote = replacePlayerName(instancePath(remote)),
-					argsText = serializeArgs(args),
-				})
+				pushRemoteEvent("S2C", "OnClientEvent", remote, args, n, nil, nil, "OnClientEvent")
 			end)
 		end))
 	end
 	if remote:IsA("RemoteFunction") then
-		trackConn(remote.OnClientInvoke:Connect(function(...)
-			local args = { ... }
-			task.defer(function()
-				livePush({
-					dir = "S2C",
-					kind = "OnClientInvoke",
-					remote = replacePlayerName(instancePath(remote)),
-					argsText = serializeArgs(args),
-				})
-			end)
-		end))
+		wrapOnClientInvoke(remote)
 	end
 end
+
+local function dumpLateScript(inst, sourceTag)
+	if not isScript(inst) or isIgnored(inst) then
+		return
+	end
+	local path = instancePath(inst)
+	if ScriptSeen[path] then
+		for _, meta in ipairs(ScriptMeta) do
+			if meta.path == replacePlayerName(path) then
+				meta.last_seen = os.time()
+				break
+			end
+		end
+		return
+	end
+	if ScriptsDumped >= Config.maxScripts then
+		livePush({
+			dir = "INST",
+			method = "ScriptAddedCapped",
+			remote = replacePlayerName(path),
+			class = inst.ClassName,
+			argsText = inst.ClassName,
+			source = sourceTag,
+		})
+		return
+	end
+	local entry = {
+		script = inst,
+		path = path,
+		class = inst.ClassName,
+		source = sourceTag,
+		isNil = not inst:IsDescendantOf(game),
+	}
+	dumpOneScript(entry)
+	ScriptIndex.dumped = ScriptsDumped
+	writeScriptMetadata()
+	livePush({
+		dir = "INST",
+		method = "ScriptAdded",
+		remote = replacePlayerName(path),
+		class = inst.ClassName,
+		argsText = inst.ClassName,
+		source = sourceTag,
+	})
+end
+
 local function hookAllRemotes()
 	local n = 0
 	for _, inst in ipairs(game:GetDescendants()) do
-		if inst:IsA("RemoteEvent") or inst:IsA("UnreliableRemoteEvent") or inst:IsA("RemoteFunction") then
+		if isNetworkRemote(inst) then
 			hookRemoteIncoming(inst)
 			n += 1
 		end
 	end
 	trackConn(game.DescendantAdded:Connect(function(inst)
-		if inst:IsA("RemoteEvent") or inst:IsA("UnreliableRemoteEvent") or inst:IsA("RemoteFunction") then
-			task.defer(function()
+		task.defer(function()
+			if not Core.running then
+				return
+			end
+			if isNetworkRemote(inst) then
 				hookRemoteIncoming(inst)
 				livePush({
 					dir = "INST",
-					kind = "RemoteAdded",
+					method = "RemoteAdded",
 					remote = replacePlayerName(instancePath(inst)),
+					class = inst.ClassName,
 					argsText = inst.ClassName,
+					source = "DescendantAdded",
 				})
-			end)
-		end
+			elseif isScript(inst) then
+				dumpLateScript(inst, "DescendantAdded")
+			end
+		end)
 	end))
 	log("done", "live S2C listeners on " .. n .. " remotes")
 end
+
 local function watchLeaderstats()
 	if not Config.liveWatchStats then
 		return
@@ -966,17 +1657,21 @@ local function watchLeaderstats()
 	for _, v in ipairs(ls:GetDescendants()) do
 		if v:IsA("ValueBase") then
 			trackConn(v:GetPropertyChangedSignal("Value"):Connect(function()
+				local ser = serializeValue(v.Value)
 				livePush({
 					dir = "STAT",
-					kind = "leaderstats",
+					method = "leaderstats",
 					name = v.Name,
 					path = replacePlayerName(instancePath(v)),
-					argsText = tostring(v.Value),
+					args = { ser },
+					argsText = compactValue(ser),
+					source = "leaderstats",
 				})
 			end))
 		end
 	end
 end
+
 local function watchCharacter(char)
 	if not Config.liveWatchCharacter or not char then
 		return
@@ -986,96 +1681,182 @@ local function watchCharacter(char)
 		trackConn(hum:GetPropertyChangedSignal("Health"):Connect(function()
 			livePush({
 				dir = "STAT",
-				kind = "Health",
+				method = "Health",
 				name = LocalPlayer.Name,
 				argsText = string.format("%.1f/%.1f", hum.Health, hum.MaxHealth),
+				source = "Humanoid",
 			})
 		end))
 		trackConn(hum.Died:Connect(function()
-			livePush({ dir = "STAT", kind = "Died", name = LocalPlayer.Name, argsText = "" })
+			livePush({ dir = "STAT", method = "Died", name = LocalPlayer.Name, argsText = "", source = "Humanoid" })
 		end))
 	end
 end
+
+local function callWithC2SGuard(fn, ...)
+	Live.c2sGuard += 1
+	local packed = table.pack(pcall(fn, ...))
+	Live.c2sGuard -= 1
+	if not packed[1] then
+		error(packed[2], 0)
+	end
+	return table.unpack(packed, 2, packed.n)
+end
+
+local function logC2S(self, method, args, n, results, retN, source)
+	if not Core.running or not Config.liveIntercept then
+		return
+	end
+	if checkCaller and checkCaller() then
+		return
+	end
+	if typeof(self) ~= "Instance" then
+		return
+	end
+	if method == "FireServer" or method == "InvokeServer" then
+		if not (self:IsA("RemoteEvent") or self:IsA("RemoteFunction") or self:IsA("UnreliableRemoteEvent")) then
+			return
+		end
+	end
+	pushRemoteEvent("C2S", method, self, args, n, results, retN, source)
+end
+
+local function hookC2SMethods()
+	if not hookFn then
+		return 0
+	end
+	local hooked = 0
+	local specs = {
+		{ "RemoteEvent", "FireServer" },
+		{ "RemoteFunction", "InvokeServer" },
+		{ "UnreliableRemoteEvent", "FireServer" },
+	}
+	for _, spec in ipairs(specs) do
+		local className, methodName = spec[1], spec[2]
+		local ok = pcall(function()
+			local dummy = Instance.new(className)
+			local fn = dummy[methodName]
+			dummy:Destroy()
+			if typeof(fn) ~= "function" then
+				return
+			end
+			local old
+			old = hookFn(fn, newClosure(function(self, ...)
+				if Live.c2sGuard > 0 then
+					return old(self, ...)
+				end
+				local n = select("#", ...)
+				local args = { ... }
+				if methodName == "InvokeServer" then
+					local results = table.pack(callWithC2SGuard(old, self, ...))
+					task.defer(function()
+						logC2S(self, methodName, args, n, results, results.n, "hookfunction")
+					end)
+					return table.unpack(results, 1, results.n)
+				end
+				local results = table.pack(callWithC2SGuard(old, self, ...))
+				task.defer(function()
+					logC2S(self, methodName, args, n, nil, nil, "hookfunction")
+				end)
+				return table.unpack(results, 1, results.n)
+			end))
+			table.insert(Core.hookedMethods, { className = className, method = methodName, original = old })
+			hooked += 1
+		end)
+		if not ok then
+			dbgWarn("hookfunction failed", className, methodName)
+		end
+	end
+	return hooked
+end
+
 local function installLiveIntercept()
 	if not Config.liveIntercept then
 		return
 	end
 	ensureDir(OUT .. "/live")
 	writeText("live/README.txt", table.concat({
-		"Live intercept — updates while you play after dump.lua runs",
+		"Live intercept — client collector telemetry after dump.lua runs",
 		"",
 		"Files:",
-		"  net.log / net-live.log  — tab-separated remote traffic",
-		"  events.jsonl            — structured events (C2S, S2C, stats)",
+		"  net.log / net-live.log  — tab-separated remote traffic (append-only)",
+		"  events.jsonl            — unified event records (pending queue flushed then cleared)",
 		"  status.json             — event count + hook status",
 		"",
-		"C2S = your client firing remotes (FireServer / InvokeServer)",
-		"S2C = server pushing to you (OnClientEvent / OnClientInvoke)",
-		"STAT = leaderstats / health changes",
-		"INST = new remotes appearing at runtime",
+		"Event fields: seq, t, clock, dir, remote, class, method, source, args, returns, truncated, thread",
 		"",
-		"Play normally: duel, throw knives, shop, trade — all gets captured.",
+		"C2S = client firing remotes (FireServer / InvokeServer) via __namecall and hookfunction",
+		"S2C = server pushing to you (OnClientEvent; OnClientInvoke callback wrap)",
+		"STAT = leaderstats / health changes",
+		"INST = new remotes or scripts appearing at runtime",
+		"",
+		"OnClientInvoke is a callback property, not an event. This collector wraps it.",
 	}, "\n"))
 	hookAllRemotes()
 	watchLeaderstats()
 	watchCharacter(LocalPlayer.Character)
 	trackConn(LocalPlayer.CharacterAdded:Connect(watchCharacter))
+	local methodHooks = hookC2SMethods()
+	if methodHooks > 0 then
+		log("done", "live C2S method hooks=" .. methodHooks)
+	end
 	if hookMeta and getNamecall then
 		local old
 		old = hookMeta(game, "__namecall", newClosure(function(self, ...)
+			if Live.c2sGuard > 0 then
+				return old(self, ...)
+			end
+			local n = select("#", ...)
 			local args = { ... }
 			local method = getNamecall()
 			local shouldLog = method == "FireServer" or method == "InvokeServer"
 				or method == "PromptProductPurchase" or method == "PromptGamePassPurchase"
 			if shouldLog and Core.running and (not checkCaller or not checkCaller()) then
-				local remotePath = "?"
-				pcall(function()
-					remotePath = replacePlayerName(instancePath(self))
-				end)
 				if method == "InvokeServer" then
-					local results = { old(self, table.unpack(args)) }
+					local results = table.pack(callWithC2SGuard(old, self, ...))
 					task.defer(function()
-						livePush({
-							dir = "C2S",
-							kind = "InvokeServer",
-							remote = remotePath,
-							argsText = serializeArgs(args),
-							retText = serializeArg(results[1]),
-						})
+						logC2S(self, method, args, n, results, results.n, "namecall")
 					end)
-					return table.unpack(results)
+					return table.unpack(results, 1, results.n)
 				end
+				local results = table.pack(callWithC2SGuard(old, self, ...))
 				task.defer(function()
-					livePush({
-						dir = "C2S",
-						kind = method,
-						remote = remotePath,
-						argsText = serializeArgs(args),
-					})
+					logC2S(self, method, args, n, nil, nil, "namecall")
 				end)
+				return table.unpack(results, 1, results.n)
 			end
-			return old(self, table.unpack(args))
+			return old(self, ...)
 		end))
 		Core.namecallHook = old
 		log("done", "live C2S namecall hook installed")
 	else
-		log("warn", "live C2S hook unavailable (no hookmetamethod)")
+		log("warn", "live C2S namecall unavailable (no hookmetamethod)")
 	end
 	trackConn(RunService.Heartbeat:Connect(function()
+		if not Core.running then
+			return
+		end
 		if Live.n > 0 and (os.clock() - Live.lastFlush) > 3 then
 			pcall(flushLiveLogs)
+		end
+		if os.clock() - Live.lastRewrap > 1 then
+			Live.lastRewrap = os.clock()
+			for remote, wrap in pairs(Live.invokeWrap) do
+				local current = nil
+				pcall(function()
+					current = remote.OnClientInvoke
+				end)
+				if current ~= wrap then
+					wrapOnClientInvoke(remote)
+				end
+			end
 		end
 	end))
 	flushLiveLogs()
 	log("done", "LIVE INTERCEPT ACTIVE — play the game, watch live/net.log grow")
 	dbg("LIVE", "intercept running →", OUT .. "/live/")
 end
-local function netPush(direction, remotePath, detail)
-	livePush({ dir = direction, kind = "legacy", remote = remotePath, argsText = detail })
-end
-local function installNetHooks()
-	installLiveIntercept()
-end
+
 local function getPlaceName()
 	local ok, info = pcall(function()
 		return MarketplaceService:GetProductInfo(game.PlaceId)
@@ -1085,6 +1866,7 @@ local function getPlaceName()
 	end
 	return "UnknownPlace"
 end
+
 local function buildOutPath(placeId, placeName)
 	placeName = string.gsub(placeName, "%s+", "_")
 	placeName = string.gsub(placeName, "^_+", "")
@@ -1094,32 +1876,36 @@ local function buildOutPath(placeId, placeName)
 	end
 	return string.format("%s/%s_%s", Config.mainDir, tostring(placeId), placeName)
 end
+
 local function writeLimitations()
 	writeText("LIMITATIONS.txt", table.concat({
-		"Universal Dumper — what client-side dumping CAN and CANNOT do",
-		"==============================================================",
+		"roblox-dumper " .. VERSION .. " — client collector",
+		"================================================",
+		"",
+		"This is a client-side snapshot + telemetry tool.",
+		"It cannot reconstruct unreplicated server source.",
 		"",
 		"CAN dump from a client executor:",
-		"  • LocalScripts, ModuleScripts, and any Script instances replicated to client",
+		"  • LocalScripts, ModuleScripts, and Script instances replicated to this client",
 		"  • Scripts returned by getscripts / getrunningscripts / getloadedmodules",
 		"  • Nil-parented scripts (getnilinstances)",
-		"  • Full ReplicatedStorage / Workspace / PlayerGui trees (client view)",
-		"  • All RemoteEvents/Functions the client can see",
-		"  • Client→server traffic (FireServer/InvokeServer) via hooks",
+		"  • ReplicatedStorage / Workspace / PlayerGui trees (client view)",
+		"  • RemoteEvent / RemoteFunction / UnreliableRemoteEvent instances the client can see",
+		"  • Client→server and server→client traffic the client actually observes",
 		"",
 		"CANNOT dump from client alone:",
 		"  • ServerScriptService / ServerStorage scripts that never replicate",
-		"  • Pure server Script instances not loaded into client memory",
-		"  • Server-side-only ModuleScripts never required on client",
+		"  • Server-only ModuleScripts never required on the client",
+		"  • Server remote handlers and server runtime state",
 		"",
-		"For true server dumps you need:",
-		"  • Roblox Studio access to the place file, OR",
-		"  • A server-side plugin / Studio command bar script, OR",
-		"  • Official place download if you own the game",
+		"server-access.json is a diagnostic of the client view of those containers.",
+		"An empty or filtered tree is expected. It is not a failed server dump.",
 		"",
-		"This tool maximizes everything reachable from the client.",
+		"For an authorized server dump of a place you own, use a Studio collector",
+		"(ScriptEditorService / place file). See ROADMAP.md in the repository.",
 	}, "\n"))
 end
+
 local function runPhase(name, fn)
 	Log.phase = name
 	local ok, err = pcall(fn)
@@ -1128,6 +1914,17 @@ local function runPhase(name, fn)
 	end
 	return ok
 end
+
+local function restoreInvokeWraps()
+	for remote, wrap in pairs(Live.invokeWrap) do
+		pcall(function()
+			if remote.OnClientInvoke == wrap then
+				remote.OnClientInvoke = Live.invokePrev[remote]
+			end
+		end)
+	end
+end
+
 local function runAll()
 	dbg("=== DUMP START ===")
 	if not probeFilesystem() then
@@ -1156,20 +1953,21 @@ local function runAll()
 			exploitName, exploitVersion = tostring(a or "Unknown"), tostring(b or "")
 		end
 	end
-	log("boot", string.format("place=%s (%s) executor=%s", tostring(placeId), placeName, exploitName))
+	log("boot", string.format("v%s place=%s (%s) executor=%s", VERSION, tostring(placeId), placeName, exploitName))
 	if Config.disableRender then
 		pcall(function()
 			RunService:Set3dRenderingEnabled(false)
 		end)
 	end
-	local serverAccess = probeServerContainers()
 	writeJson("server-access.json", {
-		note = "Shows whether server containers are visible from client (usually NOT)",
-		items = serverAccess,
+		note = "Diagnostic of the client view of non-replicated containers. This is not a server dump.",
+		items = probeNonReplicatedContainers(),
 	})
 	writeLimitations()
 	writeJson("meta.json", {
 		at = os.time(),
+		version = VERSION,
+		mode = "client",
 		placeId = placeId,
 		placeName = placeName,
 		jobId = game.JobId,
@@ -1182,21 +1980,26 @@ local function runAll()
 			getscripts = getScripts ~= nil,
 			getnilinstances = getNilInstances ~= nil,
 			getscriptbytecode = getBytecode ~= nil,
+			getscripthash = getScriptHash ~= nil,
 			hookmetamethod = hookMeta ~= nil,
+			hookfunction = hookFn ~= nil,
 			getconnections = getConnections ~= nil,
+			getinfo = getInfo ~= nil,
+			httprequest = httpRequest ~= nil,
 		},
 	})
 	local scriptList = collectAllScripts()
-	local serverScripts = 0
+	local replicatedScriptClass = 0
 	for _, entry in ipairs(scriptList) do
 		if entry.class == "Script" then
-			serverScripts += 1
+			replicatedScriptClass += 1
 		end
 	end
-	log("boot", string.format("found %d scripts (%d Script/server-class)", #scriptList, serverScripts))
+	log("boot", string.format("found %d scripts (%d Script-class replicated to client)", #scriptList, replicatedScriptClass))
 	writeJson("script-inventory.json", {
 		count = #scriptList,
-		serverClass = serverScripts,
+		replicatedScriptClass = replicatedScriptClass,
+		note = "Script-class count is instances visible to the client, not ServerScriptService source.",
 		sample = (function()
 			local s = {}
 			for i = 1, math.min(20, #scriptList) do
@@ -1221,25 +2024,33 @@ local function runAll()
 		runPhase("trees", dumpTrees)
 		writePhase("trees_done")
 	end
+	local hooksInstalled = false
+	if Config.hookNet and Config.liveInstallEarly then
+		runPhase("hooks", installLiveIntercept)
+		writePhase("hooks_early")
+		hooksInstalled = true
+	end
 	runPhase("scripts", function()
 		dumpAllScripts(scriptList)
 	end)
-	runPhase("catalog", buildRemoteCatalog)
+	runPhase("catalog", writeRemoteCatalog)
 	writePhase("catalog_done")
-	if Config.hookNet then
-		runPhase("hooks", installNetHooks)
+	if Config.hookNet and not hooksInstalled then
+		runPhase("hooks", installLiveIntercept)
 		writePhase("hooks_done")
 	end
 	writeJson("complete.json", {
 		at = os.time(),
 		ok = true,
+		version = VERSION,
+		mode = "client",
 		output = OUT,
 		diskPath = DISK_ROOT .. OUT:gsub("/", "\\"),
 		writes = WriteStats,
 		scriptsFound = #scriptList,
 		scriptsDumped = ScriptsDumped,
-		serverClassScripts = serverScripts,
-		message = "Dump complete. Keep playing — net-live.log captures live remotes.",
+		replicatedScriptClass = replicatedScriptClass,
+		message = "Client dump complete. Keep playing — live/events.jsonl captures observed remotes.",
 	})
 	writeText("log.txt", table.concat(Log.lines, "\n"))
 	if Config.disableRender then
@@ -1255,24 +2066,31 @@ local function runAll()
 	end
 	dbg("folder:", DISK_ROOT .. OUT:gsub("/", "\\"))
 end
+
 env.UNIVERSAL_DUMP_UNLOAD = function()
 	Core.running = false
 	for _, conn in ipairs(Core.connections) do
 		pcall(function()
-			if type(conn) == "RBXScriptConnection" then
+			if typeof(conn) == "RBXScriptConnection" then
 				conn:Disconnect()
 			end
 		end)
 	end
 	Core.connections = {}
-	if Net.buf ~= "" then
-		writeText("net-live.log", Net.buf)
+	restoreInvokeWraps()
+	if Core.namecallHook and hookMeta then
+		pcall(function()
+			hookMeta(game, "__namecall", Core.namecallHook)
+		end)
 	end
+	pcall(flushLiveLogs)
+	pcall(writeRemoteCatalog)
 	pcall(function()
 		RunService:Set3dRenderingEnabled(true)
 	end)
 	env.UNIVERSAL_DUMP_UNLOAD = nil
 end
+
 task.spawn(function()
 	local ok, err = pcall(runAll)
 	if not ok then
@@ -1282,6 +2100,7 @@ task.spawn(function()
 				writeText("CRASH.txt", tostring(err) .. "\n\n" .. table.concat(Log.lines, "\n"))
 				writeJson("complete.json", {
 					ok = false,
+					version = VERSION,
 					error = tostring(err),
 					output = OUT,
 					writes = WriteStats,
