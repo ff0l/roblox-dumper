@@ -28,6 +28,20 @@ Execute `dump.lua` in a game. Output lands under `UniversalDumper/[placeId]_Plac
 ## Architecture
 
 ```
+Collection
+   ↓
+Script discovery
+   ↓
+Metadata extraction
+   ↓
+Decompilation
+   ↓
+Serialization
+   ↓
+Filesystem output
+```
+
+```
 boot
   → resolve executor APIs (decompile, getscripts, writefile, hooks)
   → probe filesystem
@@ -112,3 +126,7 @@ This is a **client** dump. It cannot see ServerScriptService / ServerStorage con
 1. Join a place.
 2. Execute `dump.lua`.
 3. Open the folder printed in `WHERE.txt` / `complete.json`.
+
+## License
+
+Source available. See `LICENSE`. Not licensed for reuse.
