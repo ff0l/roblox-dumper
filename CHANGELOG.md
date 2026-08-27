@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.4.0
+
+Evidence/coverage collector. Still one executor file for clients. Still not a server dump.
+
+### Instance graph
+
+- Trees serialize identity (`stableId`, `parentId`, class, name, path) plus class-schema properties. `getproperties` is used when the executor provides it; otherwise BasePart / GUI / Humanoid / Sound / Value / Mesh / Decal schemas apply.
+- Path is display metadata. Snapshot diffs key by `stableId`, so a rename is a path change on the same object.
+- Unsupported serializer values are `{ type = "unsupported", robloxType, representation, lossy = true }` instead of a fake complete `tostring`.
+
+### Scripts
+
+- Content hashes no longer mix in the instance path. Identical source shares `scripts/<hash>.lua`.
+- Raw bytecode is written to `scripts/<hash>.luau-bytecode`, not stuffed into the `.lua` file.
+- Confidence is `LOW` / `MEDIUM` / `HIGH` from syntax, proto count, and constant reconstruction — not “valid syntax ⇒ high”.
+- Script records distinguish `executionContext` from `visibility`. `serverClassInstance` is still not recovered server source.
+
+### Remotes, coverage, Studio
+
+- Static remote scan follows `local x = …` aliases before `:FireServer`. This is still a text scan, not a Luau AST.
+- Catalog emits `remotes/graph.json` (script → remote → observed C2S/S2C).
+- `coverage/report.json` plus `complete.json` report what was discovered vs serialized. `server.recovered` is 0 from the client.
+- Live append fallback writes chunk files instead of concatenating forever in memory. Events include `complete` and structured `truncated`.
+- `studio/DumpPlace.lua` is an authorized Studio exporter (`ScriptEditorService:GetEditorSource`) for places you own.
+
 ## 0.3.0
 
 Snapshot/diff collector. Still one executor file. Still not a server dump.
