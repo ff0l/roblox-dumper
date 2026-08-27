@@ -13,8 +13,8 @@ UniversalDumper/13772394625_BladeBall/
   script-inventory.json
   instances.jsonl
   scripts/metadata.json
-  scripts/a1b2c3d4e5f60789.lua
-  scripts/a1b2c3d4e5f60789.luau-bytecode
+  scripts/Net.a1b2c3d4.lua
+  scripts/Net.a1b2c3d4.luau-bytecode
   remotes/catalog.json
   remotes/graph.json
   remotes/observations.jsonl
@@ -71,8 +71,8 @@ Script metadata item (shape):
   "stableId": "01f2…",
   "class": "ModuleScript",
   "contentHash": "a1b2c3d4e5f60789",
-  "file": "scripts/a1b2c3d4e5f60789.lua",
-  "bytecode_file": "scripts/a1b2c3d4e5f60789.luau-bytecode",
+  "file": "scripts/Net.a1b2c3d4.lua",
+  "bytecode_file": "scripts/Net.a1b2c3d4.luau-bytecode",
   "discovery": ["descendants", "getloadedmodules"],
   "executionContext": "unknown",
   "visibility": "replicated",

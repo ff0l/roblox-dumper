@@ -21,7 +21,7 @@ if type(env) == "table" and type(env.UNIVERSAL_DUMP_UNLOAD) == "function" then
 	pcall(env.UNIVERSAL_DUMP_UNLOAD)
 end
 
-local VERSION = "0.4.1"
+local VERSION = "0.4.2"
 local Config = {
 	mainDir = "UniversalDumper",
 	debug = false,
@@ -40,6 +40,7 @@ local Config = {
 	dumpGui = true,
 	dumpValues = true,
 	dumpAttributes = true,
+	fullProperties = false,
 	hookNet = true,
 	hookClientReceive = true,
 	liveIntercept = true,
@@ -126,6 +127,7 @@ local readFile = pickFn(typeof(readfile) == "function" and readfile, env and env
 local listFiles = pickFn(typeof(listfiles) == "function" and listfiles, env and env.listfiles)
 local makeFolder = pickFn(typeof(makefolder) == "function" and makefolder, env and env.makefolder)
 local isFolder = pickFn(typeof(isfolder) == "function" and isfolder, env and env.isfolder)
+local isFile = pickFn(typeof(isfile) == "function" and isfile, env and env.isfile)
 local httpRequest = pickFn(typeof(request) == "function" and request, typeof(http_request) == "function" and http_request, env and env.request)
 local appendFile = pickFn(typeof(appendfile) == "function" and appendfile, env and env.appendfile)
 local identifyExecutor = pickFn(typeof(identifyexecutor) == "function" and identifyexecutor, env and env.identifyexecutor)
@@ -164,7 +166,8 @@ local Live = {
 	pending = {},
 	pendingNet = "",
 	recent = {},
-	fallbackFiles = {},
+	fallbackBuf = {},
+	appendReady = {},
 	remotesHooked = {},
 	invokePrev = {},
 	invokeWrap = {},
@@ -172,7 +175,6 @@ local Live = {
 	lastRewrap = os.clock(),
 	lastCatalogWrite = 0,
 	c2sGuard = 0,
-	chunkN = 0,
 }
 
 local writeText
@@ -310,6 +312,22 @@ writeJson = function(rel, payload)
 	return ok
 end
 
+local function fileExists(full)
+	if isFile then
+		local ok, yes = pcall(isFile, full)
+		if ok and yes then
+			return true
+		end
+	end
+	if readFile then
+		local ok = pcall(readFile, full)
+		if ok then
+			return true
+		end
+	end
+	return false
+end
+
 local function appendText(rel, text)
 	if not text or text == "" then
 		return true
@@ -323,17 +341,41 @@ local function appendText(rel, text)
 	else
 		ensureDir(OUT)
 	end
+	local full = OUT .. "/" .. rel
 	if appendFile then
-		local ok, err = pcall(appendFile, OUT .. "/" .. rel, text)
+		if not Live.appendReady[rel] then
+			if not fileExists(full) then
+				pcall(writeFile, full, "")
+			end
+			Live.appendReady[rel] = true
+		end
+		local ok, err = pcall(appendFile, full, text)
+		if ok then
+			WriteStats.ok += 1
+			return true
+		end
+		if not fileExists(full) then
+			pcall(writeFile, full, "")
+		end
+		ok, err = pcall(appendFile, full, text)
 		if ok then
 			WriteStats.ok += 1
 			return true
 		end
 		dbgWarn("appendfile failed:", rel, err)
 	end
-	Live.chunkN += 1
-	local chunkRel = rel .. "." .. string.format("%06d", Live.chunkN)
-	return writeText(chunkRel, text)
+	local prev = ""
+	if readFile then
+		local rok, content = pcall(readFile, full)
+		if rok and type(content) == "string" then
+			prev = content
+		end
+	elseif Live.fallbackBuf[rel] then
+		prev = Live.fallbackBuf[rel]
+	end
+	local combined = prev .. text
+	Live.fallbackBuf[rel] = nil
+	return writeText(rel, combined)
 end
 
 log = function(kind, text)
@@ -541,7 +583,7 @@ end
 local function collectProperties(inst)
 	local out = {}
 	local complete = false
-	if getPropertiesFn then
+	if Config.fullProperties and getPropertiesFn then
 		local ok, props = pcall(getPropertiesFn, inst)
 		if ok and type(props) == "table" then
 			for k, v in pairs(props) do
@@ -608,7 +650,7 @@ local function fnv1aHex(s)
 	local h = 2166136261
 	for i = 1, #s do
 		h = bit32.bxor(h, string.byte(s, i))
-		h = bit32.mul(h, 16777619)
+		h = bit32.band(h * 16777619, 0xFFFFFFFF)
 	end
 	return string.format("%08x", h)
 end
@@ -1296,8 +1338,28 @@ local function contentHash(scriptInst, source, bytecode)
 	return "inst_" .. fnv1aHex(stableIdOf(scriptInst) or "")
 end
 
-local function scriptFileName(hash)
-	return "scripts/" .. safePathSegment(hash) .. ".lua", hash
+local function scriptStem(name, hash)
+	local short = string.lower(string.sub(tostring(hash), 1, 8))
+	local base = safePathSegment(name)
+	base = string.gsub(base, "%s+", "_")
+	if base == "" or base == "unknown" then
+		base = "script"
+	end
+	if #base > 60 then
+		base = string.sub(base, 1, 60)
+	end
+	return "scripts/" .. base .. "." .. short
+end
+
+local function scriptFileName(hash, name)
+	local existing = HashUsed[hash]
+	if type(existing) == "table" then
+		return existing.lua, hash, existing.stem, true
+	end
+	local stem = scriptStem(name, hash)
+	local luaRel = stem .. ".lua"
+	HashUsed[hash] = { lua = luaRel, stem = stem }
+	return luaRel, hash, stem, false
 end
 
 local function scriptContext(entry)
@@ -1396,10 +1458,10 @@ dumpOneScript = function(entry)
 		local pipeline = scriptPipeline(status, assess.syntax, bytecodeAvailable)
 		pipeline.sourceKind = sourceForHash and "lua" or (bytecodeAvailable and "bytecode" or "none")
 		local hash = contentHash(scriptInst, sourceForHash, bytecodeBlob)
-		local relPath, storedHash = scriptFileName(hash)
+		local relPath, storedHash, stem, reused = scriptFileName(hash, scriptInst.Name)
 		local bytecodeRel = nil
 		if bytecodeBlob then
-			bytecodeRel = "scripts/" .. safePathSegment(storedHash) .. ".luau-bytecode"
+			bytecodeRel = stem .. ".luau-bytecode"
 			if not BytecodeWritten[storedHash] then
 				writeText(bytecodeRel, bytecodeBlob)
 				BytecodeWritten[storedHash] = true
@@ -1431,9 +1493,8 @@ dumpOneScript = function(entry)
 			extractRemoteStrings(sourceForHash, entry.path, item.stableId)
 		end
 		local wrote = true
-		if not HashUsed[storedHash] then
+		if not reused then
 			wrote = writeText(relPath, header)
-			HashUsed[storedHash] = true
 		end
 		if wrote then
 			item.file = relPath
@@ -1850,7 +1911,18 @@ local function dumpValues()
 			end
 		end
 	end
-	writeJson("values-all.json", { count = #rows, items = rows })
+	writeText("values.jsonl", "")
+	for _, row in ipairs(rows) do
+		local line = jsonEncode(row)
+		if line then
+			appendText("values.jsonl", line .. "\n")
+		end
+	end
+	writeJson("values-all.json", {
+		count = #rows,
+		jsonl = "values.jsonl",
+		note = "Items are in values.jsonl (HttpService cannot encode huge arrays).",
+	})
 	log("done", "values=" .. #rows)
 end
 
@@ -1895,14 +1967,12 @@ local function dumpGui()
 			appendText("gui.jsonl", line .. "\n")
 		end
 	end
-	if not writeJson("gui-full.json", { count = #rows, items = rows }) then
-		writeJson("gui-full.json", {
-			count = #rows,
-			jsonl = "gui.jsonl",
-			truncated = Coverage.gui.truncated,
-			note = "Items omitted; HttpService JSONEncode failed. See gui.jsonl.",
-		})
-	end
+	writeJson("gui-full.json", {
+		count = #rows,
+		jsonl = "gui.jsonl",
+		truncated = Coverage.gui.truncated,
+		note = "Items are in gui.jsonl (HttpService cannot encode huge arrays).",
+	})
 	log("done", "gui=" .. #rows)
 end
 
@@ -1968,7 +2038,6 @@ local function dumpTrees()
 	Log.phase = "trees"
 	ensureDir(OUT .. "/trees")
 	writeText("instances.jsonl", "")
-	Live.fallbackFiles["instances.jsonl"] = ""
 	local roots = {
 		{ Workspace, "Workspace" },
 		{ ReplicatedStorage, "ReplicatedStorage" },
@@ -2041,9 +2110,26 @@ local function captureSnapshotState()
 			elseif inst:IsA("GuiObject") then
 				gui[sid] = { path = path, class = inst.ClassName, visible = inst.Visible }
 			end
-			if inst:IsA("BasePart") or inst:IsA("Humanoid") or inst:IsA("Sound") or inst:IsA("Tool") or inst:IsA("GuiObject") then
-				local collected = collectProperties(inst)
-				props[sid] = { path = path, class = inst.ClassName, sig = fingerprintSig(collected) }
+			if inst:IsA("BasePart") then
+				local okp, cf, sz = pcall(function()
+					return tostring(inst.CFrame), tostring(inst.Size)
+				end)
+				if okp then
+					props[sid] = { path = path, class = inst.ClassName, sig = cf .. "|" .. sz }
+				end
+			elseif inst:IsA("Humanoid") then
+				local okp, hs, ws = pcall(function()
+					return inst.Health, inst.WalkSpeed
+				end)
+				if okp then
+					props[sid] = { path = path, class = inst.ClassName, sig = tostring(hs) .. "|" .. tostring(ws) }
+				end
+			elseif inst:IsA("Sound") then
+				props[sid] = { path = path, class = inst.ClassName, playing = inst.Playing }
+			elseif inst:IsA("Tool") then
+				props[sid] = { path = path, class = inst.ClassName, enabled = inst.Enabled }
+			elseif inst:IsA("GuiObject") then
+				props[sid] = { path = path, class = inst.ClassName, visible = inst.Visible }
 			end
 			if Config.dumpAttributes then
 				local a = inst:GetAttributes()
@@ -2288,15 +2374,13 @@ takeSnapshot = function()
 		rec.counts.props += 1
 	end
 	ensureDir(OUT .. "/snapshots")
-	if not writeJson(string.format("snapshots/%06d.json", id), rec) then
-		writeJson(string.format("snapshots/%06d.json", id), {
-			id = id,
-			at = rec.at,
-			clock = rec.clock,
-			counts = rec.counts,
-			note = "Full maps kept in memory for diffs; HttpService JSONEncode cannot hold this checkpoint.",
-		})
-	end
+	writeJson(string.format("snapshots/%06d.json", id), {
+		id = id,
+		at = rec.at,
+		clock = rec.clock,
+		counts = rec.counts,
+		note = "Full maps stay in memory for diffs.",
+	})
 	if Snap.last then
 		local prev = Snap.last
 		local diff = { from = prev.id, to = id, at = rec.at }
@@ -2417,7 +2501,7 @@ flushLiveLogs = function()
 		running = Core.running,
 		note = "Pending queue is cleared after each successful flush. recent[] is UI-only.",
 	})
-	if os.clock() - Live.lastCatalogWrite > 5 then
+	if os.clock() - Live.lastCatalogWrite > 30 then
 		pcall(writeRemoteCatalog)
 	end
 	Live.lastFlush = os.clock()
@@ -2839,7 +2923,7 @@ local function installLiveIntercept()
 		if not Core.running then
 			return
 		end
-		if (os.clock() - Live.lastFlush) > 1 then
+		if (os.clock() - Live.lastFlush) > 3 then
 			pcall(flushLiveLogs)
 		end
 		if os.clock() - Live.lastRewrap > 1 then
@@ -2870,7 +2954,7 @@ local function getPlaceName()
 		return MarketplaceService:GetProductInfo(game.PlaceId)
 	end)
 	if ok and type(info) == "table" and info.Name then
-		return safePathSegment(string.gsub(info.Name, "^%s+", ""))
+		return safePathSegment((string.gsub(info.Name, "^%s+", "")))
 	end
 	return "UnknownPlace"
 end
@@ -2900,7 +2984,7 @@ local function writeLimitations()
 		"  • ReplicatedStorage / Workspace / PlayerGui trees (client view)",
 		"  • RemoteEvent / RemoteFunction / UnreliableRemoteEvent instances the client can see",
 		"  • Client→server and server→client traffic the client actually observes",
-		"  • Instance properties (getproperties when present, otherwise class schemas)",
+		"  • Instance properties (class schemas; set Config.fullProperties for getproperties)",
 		"  • Raw bytecode as .luau-bytecode when getscriptbytecode is available",
 		"",
 		"CANNOT dump from client alone:",

@@ -6,14 +6,14 @@ This is a **client collector**, not a server dumper. Unreplicated `ServerScriptS
 
 One executor file: `dump.lua`. Output goes to `UniversalDumper/[placeId]_PlaceName/` in the executor workspace.
 
-v0.4.1 research tool, not a game script pack.
+v0.4.2 research tool, not a game script pack.
 
 ## What it dumps
 
-- Instance graph: `stableId` / `parentId` plus class-schema properties (or `getproperties` when present)
+- Instance graph: `stableId` / `parentId` plus class-schema properties (`Config.fullProperties` for `getproperties`)
 - RemoteEvent / RemoteFunction / UnreliableRemoteEvent index, alias-aware static refs, `remotes/graph.json`
 - GUI, values, attributes, asset content IDs
-- Scripts with discovery tags, reconstruction scoring (`LOW`/`MEDIUM`/`HIGH`), content-addressed `.lua` plus raw `.luau-bytecode`
+- Scripts named `Name.hash8.lua` plus matching `.luau-bytecode` (hash-shared)
 - Structured Roblox types; unsupported values are marked `lossy`
 - Live C2S / S2C intercept (`OnClientInvoke` is wrapped as a callback, not `:Connect`)
 - Periodic snapshots keyed by stable id, plus `coverage/report.json`
@@ -55,8 +55,8 @@ UniversalDumper/<place>/
   server-visibility.json
   instances.jsonl
   scripts/metadata.json
-  scripts/<hash>.lua
-  scripts/<hash>.luau-bytecode
+  scripts/Name.hash8.lua
+  scripts/Name.hash8.luau-bytecode
   remotes/catalog.json
   remotes/graph.json
   remotes/observations.jsonl
@@ -85,6 +85,7 @@ Edit the `Config` table at the top of `dump.lua`.
 | `hookNet` | `true` | Namecall / method hooks after dump |
 | `liveIntercept` | `true` | Record live remote traffic |
 | `liveInstallEarly` | `true` | Install hooks before decompile |
+| `fullProperties` | `false` | Use executor `getproperties` on every instance |
 | `liveFlushEvery` | `8` | Flush pending live events this often |
 | `snapshotDiff` | `true` | Periodic snapshots after the initial dump |
 | `snapshotEvery` | `20` | Seconds between snapshots |

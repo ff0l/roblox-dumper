@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.4.2
+
+Readable script files and live I/O that does not stall the client.
+
+- Script artifacts are `scripts/Name.hash8.lua` with a matching `.luau-bytecode`. Identical content still shares one file.
+- `appendfile` creates the target file first. Failed append overwrites one file; it does not spawn `*.000591` chunk files.
+- Live catalog rewrite is every 30s. Heartbeat flush is 3s.
+- `gui-full.json` / `values-all.json` are indexes. Items stay in jsonl.
+- `Config.fullProperties` defaults to false (class schemas). Snapshots fingerprint CFrame/Size/Visible without a full `getproperties` pass.
+- Luau: FNV uses `bit32.band(h * 16777619, 0xFFFFFFFF)`; `getPlaceName` does not pass `string.gsub`'s count into `safePathSegment`.
+
 ## 0.4.1
 
 Potassium client runtime fixes. UniqueId is all zeros on this client, so it is not identity.
