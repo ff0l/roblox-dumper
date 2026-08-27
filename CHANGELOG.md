@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.4.5
+
+Decompile retries bytecode and the script closure, then a rename pass turns `uN`/`vN` into GetService / WaitForChild / ClassName / module-return names. `string.char` folds. Constants that never appear in the decompiled text are listed. Empty decompiler stubs (`-- Empty bytecode`) are not counted as source. Original identifiers are still not in Luau bytecode.
+
 ## 0.4.4
 
 Snapshots no longer walk 70k descendants. They diff in-memory remotes/scripts plus leaderstats. Diff lines are counts plus a 40-entry sample, not 150KB of moving-part CFrames. Coverage `percent.instances` is serialized/(serialized+failed); empty schemas stay in `unschematized`.

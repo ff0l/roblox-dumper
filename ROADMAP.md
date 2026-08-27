@@ -20,6 +20,7 @@ Next:
 - Dependency graph viewer
 - Timeline / snapshot viewer
 - Dedicated bytecode pipeline (opcodes, prototypes, CFG)
+- Stronger deobfuscation (parameter names, VM unpackers) — v0.4.5 is GetService/WaitForChild/ClassName/return only
 - Bounded decompile workers (job queue exists sequentially; `Config.threads` is unused)
 
 References: [luau-lang/luau Bytecode.h](https://github.com/luau-lang/luau/blob/master/Common/include/Luau/Bytecode.h), [PumbaaDev/luau-decompiler](https://github.com/PumbaaDev/luau-decompiler).

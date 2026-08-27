@@ -6,7 +6,7 @@ This is a **client collector**, not a server dumper. Unreplicated `ServerScriptS
 
 One executor file: `dump.lua`. Output goes to `UniversalDumper/[placeId]_PlaceName/` in the executor workspace.
 
-v0.4.4 research tool, not a game script pack.
+v0.4.5 research tool, not a game script pack.
 
 ## What it dumps
 
@@ -14,6 +14,8 @@ v0.4.4 research tool, not a game script pack.
 - RemoteEvent / RemoteFunction / UnreliableRemoteEvent index, alias-aware static refs, `remotes/graph.json`
 - GUI, values, attributes, asset content IDs
 - Scripts named `Name.hash8.lua` plus matching `.luau-bytecode` (hash-shared)
+- Deobfuscation pass: rename `uN`/`vN` from GetService, WaitForChild, ClassName, module return; fold `string.char`; list missing constants
+- `scripts/Name.hash8.constants.json` from `getconstants`
 - Structured Roblox types; unsupported values are marked `lossy`
 - Live C2S / S2C intercept (`OnClientInvoke` is wrapped as a callback, not `:Connect`)
 - Periodic snapshots keyed by stable id, plus `coverage/report.json`
@@ -33,7 +35,7 @@ Quiet by default (`Config.debug = false`).
 capability detection + session metadata
   → remotes, values, GUI, instance graph, assets
   → optional live hooks (Config.liveInstallEarly)
-  → sequential script jobs (decompile → serialize → write)
+  → sequential script jobs (decompile → deobfuscate → serialize → write)
   → remote catalog + graph
   → snapshot 000001 + coverage/report.json
   → runtime: remotes/scripts, pending event flush, snapshot diffs
@@ -80,6 +82,8 @@ Edit the `Config` table at the top of `dump.lua`.
 | Key | Default | Meaning |
 |-----|---------|---------|
 | `decompile` | `true` | Call executor decompiler |
+| `deobfuscate` | `true` | Rename decompiler placeholders from APIs/constants |
+| `dumpScriptConstants` | `true` | Write `scripts/*.constants.json` |
 | `maxScripts` | `2000` | Cap on dumped scripts |
 | `maxTreePerRoot` | `60000` | Tree node cap per root |
 | `hookNet` | `true` | Namecall / method hooks after dump |
@@ -98,7 +102,7 @@ Need `writefile` + `makefolder` to save. Everything else degrades: missing `deco
 
 ## Limits
 
-Client dump only. An empty `ServerScriptService` / `ServerStorage` tree is expected. See `LIMITATIONS.txt`. Static remotes are still a text scan (alias-aware), not a full Luau AST.
+Client dump only. An empty `ServerScriptService` / `ServerStorage` tree is expected. See `LIMITATIONS.txt`. Luau bytecode does not store original local names; the deobfuscate pass is heuristic rename, not recovered source. Static remotes are still a text scan (alias-aware), not a full Luau AST.
 
 ## License
 

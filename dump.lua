@@ -21,11 +21,13 @@ if type(env) == "table" and type(env.UNIVERSAL_DUMP_UNLOAD) == "function" then
 	pcall(env.UNIVERSAL_DUMP_UNLOAD)
 end
 
-local VERSION = "0.4.4"
+local VERSION = "0.4.5"
 local Config = {
 	mainDir = "UniversalDumper",
 	debug = false,
 	decompile = true,
+	deobfuscate = true,
+	dumpScriptConstants = true,
 	dumpDebug = false,
 	detailedDebug = false,
 	threads = 1,
@@ -147,7 +149,7 @@ local ScriptIndex = { totalFound = 0, dumped = 0, failed = 0, timedOut = 0, item
 local Snap = { n = 0, last = nil, lastAt = 0, busy = false }
 local Coverage = {
 	instances = { discovered = 0, serialized = 0, failed = 0, unschematized = 0, truncated = false },
-	scripts = { discovered = 0, decompiled = 0, bytecode_only = 0, failed = 0, syntaxValid = 0 },
+	scripts = { discovered = 0, decompiled = 0, bytecode_only = 0, failed = 0, syntaxValid = 0, deobfuscated = 0 },
 	remotes = { discovered = 0, observed = 0 },
 	gui = { discovered = 0, serialized = 0, truncated = false },
 	assets = { discovered = 0 },
@@ -1125,7 +1127,41 @@ local function probeNonReplicatedContainers()
 	return rows
 end
 
-local function decompileScript(scriptInst)
+local function isEmptyDecompile(text)
+	if type(text) ~= "string" then
+		return true
+	end
+	local compact = string.lower((string.gsub(text, "%s+", "")))
+	if compact == "" then
+		return true
+	end
+	if string.find(compact, "emptybytecode", 1, true) then
+		return true
+	end
+	if string.find(compact, "failedtodecompile", 1, true) then
+		return true
+	end
+	if string.find(compact, "nodecompiler", 1, true) then
+		return true
+	end
+	return false
+end
+
+local function tryCallDecompile(target)
+	if not decompileFn or target == nil then
+		return nil
+	end
+	local output = nil
+	local ok = pcall(function()
+		output = decompileFn(target)
+	end)
+	if ok and not isEmptyDecompile(output) then
+		return output
+	end
+	return nil
+end
+
+local function decompileScript(scriptInst, bytecodeBlob)
 	if not decompileFn then
 		return nil, "no decompiler"
 	end
@@ -1138,17 +1174,329 @@ local function decompileScript(scriptInst)
 	if hash and DecompileCache[hash] then
 		return DecompileCache[hash], "cache"
 	end
-	local output = nil
-	local ok = pcall(function()
-		output = decompileFn(scriptInst)
-	end)
-	if not ok or type(output) ~= "string" or output:gsub("%s", "") == "" then
+	local output = tryCallDecompile(scriptInst)
+	if not output and type(bytecodeBlob) == "string" and #bytecodeBlob > 0 then
+		output = tryCallDecompile(bytecodeBlob)
+	end
+	if not output and getScriptClosure then
+		local cok, closure = pcall(getScriptClosure, scriptInst)
+		if cok and type(closure) == "function" then
+			output = tryCallDecompile(closure)
+		end
+	end
+	if not output then
 		return nil, "decompile failed"
 	end
 	if hash then
 		DecompileCache[hash] = output
 	end
 	return output, "decompiled"
+end
+
+local LUAU_RESERVED = {
+	["and"] = true,
+	["break"] = true,
+	["do"] = true,
+	["else"] = true,
+	["elseif"] = true,
+	["end"] = true,
+	["false"] = true,
+	["for"] = true,
+	["function"] = true,
+	["if"] = true,
+	["in"] = true,
+	["local"] = true,
+	["nil"] = true,
+	["not"] = true,
+	["or"] = true,
+	["repeat"] = true,
+	["return"] = true,
+	["then"] = true,
+	["true"] = true,
+	["until"] = true,
+	["while"] = true,
+	["continue"] = true,
+	["export"] = true,
+	["type"] = true,
+}
+
+local function isAnonIdent(id)
+	return string.match(id, "^[uv]%d+$") ~= nil
+end
+
+local function identFromString(raw)
+	raw = tostring(raw or "")
+	raw = string.gsub(raw, "[^%w_]", "")
+	if raw == "" or tonumber(raw) ~= nil or LUAU_RESERVED[raw] then
+		return nil
+	end
+	if not string.match(raw, "^[%a_]") then
+		raw = "_" .. raw
+	end
+	if not isAnonIdent(raw) and #raw <= 60 then
+		return raw
+	end
+	return nil
+end
+
+local function parkLiterals(src)
+	local holes = {}
+	local out = {}
+	local i = 1
+	local n = #src
+	local function sub(a, b)
+		return string.sub(src, a, b)
+	end
+	local function park(a, b)
+		table.insert(holes, sub(a, b))
+		table.insert(out, "\1" .. tostring(#holes) .. "\1")
+	end
+	while i <= n do
+		local c = sub(i, i)
+		local nxt = i < n and sub(i + 1, i + 1) or ""
+		if c == "-" and nxt == "-" then
+			local long = string.match(sub(i + 2), "^%[(=*)%[")
+			if long then
+				local close = "]" .. long .. "]"
+				local j = string.find(src, close, i + 2 + #long + 1, true)
+				if j then
+					park(i, j + #close - 1)
+					i = j + #close
+				else
+					park(i, n)
+					break
+				end
+			else
+				table.insert(out, "--")
+				i += 2
+			end
+		elseif c == "[" then
+			local eqs = string.match(sub(i), "^%[(=*)%[")
+			if eqs then
+				local close = "]" .. eqs .. "]"
+				local j = string.find(src, close, i + 2 + #eqs, true)
+				if j then
+					park(i, j + #close - 1)
+					i = j + #close
+				else
+					table.insert(out, c)
+					i += 1
+				end
+			else
+				table.insert(out, c)
+				i += 1
+			end
+		elseif c == '"' or c == "'" or c == "`" then
+			local j = i + 1
+			while j <= n do
+				local d = sub(j, j)
+				if d == "\\" then
+					j += 2
+				elseif d == c then
+					j += 1
+					break
+				else
+					j += 1
+				end
+			end
+			park(i, j - 1)
+			i = j
+		else
+			table.insert(out, c)
+			i += 1
+		end
+	end
+	return table.concat(out), holes
+end
+
+local function unparkLiterals(src, holes)
+	return (string.gsub(src, "\1(%d+)\1", function(idx)
+		return holes[tonumber(idx)] or ""
+	end))
+end
+
+local function uniqueIdent(base, taken)
+	if not taken[base] then
+		taken[base] = true
+		return base
+	end
+	local n = 2
+	while taken[base .. "_" .. n] do
+		n += 1
+	end
+	local name = base .. "_" .. n
+	taken[name] = true
+	return name
+end
+
+local function collectRenameMap(src, scriptName)
+	local proposed = {}
+	local function propose(id, name)
+		if not isAnonIdent(id) then
+			return
+		end
+		local ident = identFromString(name)
+		if ident then
+			proposed[id] = ident
+		end
+	end
+	for id, name in string.gmatch(src, "local%s+([uv]%d+)%s*=%s*game:GetService%(\"([%w]+)\"%)") do
+		propose(id, name)
+	end
+	for id, name in string.gmatch(src, "local%s+([uv]%d+)%s*=%s*Instance%.new%(\"([%w]+)\"%)") do
+		propose(id, name)
+	end
+	for id, name in string.gmatch(src, "([uv]%d+)%s*=%s*[%w%.:]+:WaitForChild%(\"([%w_]+)\"%)") do
+		propose(id, name)
+	end
+	for id, name in string.gmatch(src, "local%s+([uv]%d+)%s*=%s*require%([^;]-WaitForChild%(\"([%w_]+)\"%)") do
+		propose(id, name)
+	end
+	for id, name in string.gmatch(src, "([uv]%d+)%._name%s*=%s*\"([%w_]+)\"") do
+		propose(id, name)
+	end
+	for id, block in string.gmatch(src, "local%s+([uv]%d+)%s*=%s*(%b{})") do
+		local className = string.match(block, "ClassName%s*=%s*\"([%w_]+)\"")
+		local typeName = string.match(block, "_name%s*=%s*\"([%w_]+)\"")
+		propose(id, className or typeName)
+	end
+	for id, name in string.gmatch(src, "getmetatable%(([uv]%d+)%)%.__tostring%s*=%s*function%s*%(%s*%)[^\n]*\n%s*return%s*\"([^\"]+)\"") do
+		propose(id, name)
+	end
+	for fname, id in string.gmatch(src, "function%s+([%w_]+)%s*%([^)]*%)[^f]-\n%s*return%s+([uv]%d+)%[") do
+		if string.find(fname, "Controller", 1, true) then
+			propose(id, "Controllers")
+		elseif string.find(fname, "Service", 1, true) then
+			propose(id, "Services")
+		end
+	end
+	local ret = string.match(src, "return%s+([uv]%d+)%s*;?%s*$")
+	if ret and scriptName then
+		propose(ret, scriptName)
+	end
+	local taken = {
+		game = true,
+		script = true,
+		workspace = true,
+		plugin = true,
+		shared = true,
+		_G = true,
+	}
+	for id in string.gmatch(src, "[_%a][_%w]*") do
+		if not proposed[id] then
+			taken[id] = true
+		end
+	end
+	for word in pairs(LUAU_RESERVED) do
+		taken[word] = true
+	end
+	local map = {}
+	local keys = {}
+	for id in pairs(proposed) do
+		table.insert(keys, id)
+	end
+	table.sort(keys, function(a, b)
+		return #a > #b
+	end)
+	for _, id in ipairs(keys) do
+		map[id] = uniqueIdent(proposed[id], taken)
+	end
+	return map
+end
+
+local function foldStringChar(src)
+	local n = 0
+	local out = string.gsub(src, "string%.char%(([%d%s,]+)%)", function(body)
+		local chars = {}
+		for num in string.gmatch(body, "%d+") do
+			local v = tonumber(num)
+			if not v or v < 32 or v > 126 then
+				return "string.char(" .. body .. ")"
+			end
+			table.insert(chars, string.char(v))
+		end
+		if #chars == 0 then
+			return "string.char(" .. body .. ")"
+		end
+		n += 1
+		return string.format("%q", table.concat(chars))
+	end)
+	return out, n
+end
+
+local function collectScriptConstants(scriptInst)
+	local constants = nil
+	if not getScriptClosure or not getConstants then
+		return nil
+	end
+	local ok, closure = pcall(getScriptClosure, scriptInst)
+	if not ok or type(closure) ~= "function" then
+		return nil
+	end
+	local cok, consts = pcall(getConstants, closure)
+	if cok and type(consts) == "table" then
+		constants = consts
+	end
+	return constants
+end
+
+local function missingConstantComments(src, constants)
+	if type(constants) ~= "table" or type(src) ~= "string" then
+		return "", 0
+	end
+	local lines = { "", "-- unrecovered string constants (not present in decompiled text):" }
+	local n = 0
+	for _, c in ipairs(constants) do
+		if type(c) == "string" and #c >= 4 and #c <= 200 and not string.find(src, c, 1, true) then
+			n += 1
+			if n <= 80 then
+				table.insert(lines, "--   " .. string.format("%q", c))
+			end
+		end
+	end
+	if n == 0 then
+		return "", 0
+	end
+	if n > 80 then
+		table.insert(lines, string.format("--   … %d more", n - 80))
+	end
+	return table.concat(lines, "\n"), n
+end
+
+local function deobfuscateSource(source, scriptInst)
+	local stats = { renamed = 0, foldedChars = 0, missingConstants = 0 }
+	if type(source) ~= "string" or source == "" then
+		return source, stats
+	end
+	source = string.gsub(source, "^%-%- Decompiled with [^\n]+\n+", "")
+	source, stats.foldedChars = foldStringChar(source)
+	if not Config.deobfuscate then
+		return source, stats
+	end
+	local map = collectRenameMap(source, scriptInst and scriptInst.Name)
+	local parked, holes = parkLiterals(source)
+	local renamed = 0
+	local keys = {}
+	for id in pairs(map) do
+		table.insert(keys, id)
+	end
+	table.sort(keys, function(a, b)
+		return #a > #b
+	end)
+	for _, id in ipairs(keys) do
+		local count
+		parked, count = string.gsub(parked, "%f[%w_]" .. id .. "%f[^%w_]", map[id])
+		renamed += count
+	end
+	source = unparkLiterals(parked, holes)
+	stats.renamed = renamed
+	local constants = collectScriptConstants(scriptInst)
+	local extra
+	extra, stats.missingConstants = missingConstantComments(source, constants)
+	if extra ~= "" then
+		source ..= extra
+	end
+	return source, stats, constants
 end
 
 local function assessConfidence(scriptInst, source, status, bytecodeAvailable)
@@ -1423,7 +1771,7 @@ dumpOneScript = function(entry)
 		end
 		if Config.decompile and decompileFn then
 			while (os.clock() - started) < Config.timeout do
-				local output, mode = decompileScript(scriptInst)
+				local output, mode = decompileScript(scriptInst, bytecodeBlob)
 				if output then
 					source = output
 					status = mode
@@ -1443,6 +1791,13 @@ dumpOneScript = function(entry)
 		elseif bytecodeAvailable then
 			status = "bytecode"
 		end
+		local deobStats = { renamed = 0, foldedChars = 0, missingConstants = 0 }
+		local scriptConstants = nil
+		if source and (status == "decompiled" or status == "cache") then
+			local cleaned
+			cleaned, deobStats, scriptConstants = deobfuscateSource(source, scriptInst)
+			source = cleaned
+		end
 		local sourceForHash = (status == "decompiled" or status == "cache") and source or nil
 		local luaBody
 		if sourceForHash then
@@ -1457,6 +1812,7 @@ dumpOneScript = function(entry)
 		assess.elapsed = elapsed
 		local pipeline = scriptPipeline(status, assess.syntax, bytecodeAvailable)
 		pipeline.sourceKind = sourceForHash and "lua" or (bytecodeAvailable and "bytecode" or "none")
+		pipeline.deobfuscated = (deobStats.renamed or 0) > 0 or (deobStats.foldedChars or 0) > 0
 		local hash = contentHash(scriptInst, sourceForHash, bytecodeBlob)
 		local relPath, storedHash, stem, reused = scriptFileName(hash, scriptInst.Name)
 		local bytecodeRel = nil
@@ -1467,8 +1823,22 @@ dumpOneScript = function(entry)
 				BytecodeWritten[storedHash] = true
 			end
 		end
+		if Config.dumpScriptConstants and scriptConstants and not reused then
+			local items = {}
+			for i, c in ipairs(scriptConstants) do
+				if i > 400 then
+					break
+				end
+				table.insert(items, serializeValue(c))
+			end
+			writeJson(stem .. ".constants.json", {
+				count = #scriptConstants,
+				items = items,
+				note = "getconstants on the script closure. Not original source names.",
+			})
+		end
 		local header = string.format(
-			"-- name: %s\n-- path: %s\n-- stableId: %s\n-- class: %s\n-- collected: %s\n-- discovery: %s\n-- decompile: %s\n-- syntax: %s\n-- validation: %s\n-- bytecode: %s\n-- bytecode_file: %s\n-- constants: %s\n-- protos: %s\n-- reconstruction: %s\n-- confidence: %s\n-- contentHash: %s\n-- elapsed: %.3fs\n\n%s%s",
+			"-- name: %s\n-- path: %s\n-- stableId: %s\n-- class: %s\n-- collected: %s\n-- discovery: %s\n-- decompile: %s\n-- deobfuscate: renamed=%d foldedChars=%d missingConstants=%d\n-- syntax: %s\n-- validation: %s\n-- bytecode: %s\n-- bytecode_file: %s\n-- constants: %s\n-- protos: %s\n-- reconstruction: %s\n-- confidence: %s\n-- contentHash: %s\n-- elapsed: %.3fs\n\n%s%s",
 			tostring(scriptInst.Name),
 			getFullNameForScript(scriptInst),
 			tostring(item.stableId),
@@ -1476,6 +1846,9 @@ dumpOneScript = function(entry)
 			entry.source,
 			table.concat(entry.discovery or { entry.source }, ","),
 			assess.decompile,
+			deobStats.renamed or 0,
+			deobStats.foldedChars or 0,
+			deobStats.missingConstants or 0,
 			assess.syntax,
 			pipeline.validation,
 			tostring(bytecodeAvailable),
@@ -1509,6 +1882,7 @@ dumpOneScript = function(entry)
 			item.protoCountMatch = assess.protoCountMatch
 			item.constants = assess.constants
 			item.protos = assess.protos
+			item.deobfuscate = deobStats
 			item.pipeline = pipeline
 			item.bytecodeAvailable = bytecodeAvailable
 			item.bytecode_file = bytecodeRel
@@ -1520,6 +1894,9 @@ dumpOneScript = function(entry)
 				Coverage.scripts.decompiled += 1
 				if assess.syntax == "valid" then
 					Coverage.scripts.syntaxValid += 1
+				end
+				if pipeline.deobfuscated then
+					Coverage.scripts.deobfuscated += 1
 				end
 			elseif status == "bytecode" then
 				Coverage.scripts.bytecode_only += 1
@@ -1577,6 +1954,7 @@ dumpOneScript = function(entry)
 					protoCountMatch = assess.protoCountMatch,
 					reconstructionScore = assess.reconstructionScore,
 					confidence = assess.confidence,
+					deobfuscate = deobStats,
 					pipeline = pipeline,
 					source = pipeline.sourceAvailable,
 					bytecode = bytecodeAvailable,
@@ -2236,6 +2614,7 @@ local function collectorCapabilities()
 	return {
 		filesystem = writeFile ~= nil,
 		decompiler = decompileFn ~= nil,
+		deobfuscate = Config.deobfuscate == true,
 		bytecode = getBytecode ~= nil,
 		script_hash = getScriptHash ~= nil,
 		nil_instances = getNilInstances ~= nil,
@@ -3004,12 +3383,14 @@ local function writeLimitations()
 		"  • RemoteEvent / RemoteFunction / UnreliableRemoteEvent instances the client can see",
 		"  • Client→server and server→client traffic the client actually observes",
 		"  • Instance properties (class schemas; set Config.fullProperties for getproperties)",
-		"  • Raw bytecode as .luau-bytecode when getscriptbytecode is available",
+		"  • Decompiled source, then a rename pass from GetService/WaitForChild/ClassName/return",
+		"  • Raw bytecode as .luau-bytecode and optional scripts/*.constants.json",
 		"",
 		"CANNOT dump from client alone:",
 		"  • ServerScriptService / ServerStorage scripts that never replicate",
 		"  • Server-only ModuleScripts never required on the client",
 		"  • Server remote handlers and server runtime state",
+		"  • Original local names (Luau bytecode does not store them; uN/vN/pN are decompiler placeholders)",
 		"",
 		"server-visibility.json is a diagnostic of the client view of those containers.",
 		"An empty or filtered tree is expected. It is not a failed server dump.",
