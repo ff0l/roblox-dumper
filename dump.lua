@@ -21,7 +21,7 @@ if type(env) == "table" and type(env.UNIVERSAL_DUMP_UNLOAD) == "function" then
 	pcall(env.UNIVERSAL_DUMP_UNLOAD)
 end
 
-local VERSION = "0.4.5"
+local VERSION = "0.4.6"
 local Config = {
 	mainDir = "UniversalDumper",
 	debug = false,
@@ -69,10 +69,6 @@ local SERIAL_CAPS = {
 }
 local IGNORED_ANCESTORS = { "Chat", "CoreGui", "CorePackages" }
 local IGNORED_NAMES = { "PlayerModule", "RbxCharacterSounds", "PlayerScriptsLoader", "ChatScript", "BubbleChat" }
-local NONREPLICATED_CONTAINERS = {
-	"ServerScriptService",
-	"ServerStorage",
-}
 local NETWORK_REMOTE_CLASSES = {
 	RemoteEvent = true,
 	RemoteFunction = true,
@@ -153,7 +149,6 @@ local Coverage = {
 	remotes = { discovered = 0, observed = 0 },
 	gui = { discovered = 0, serialized = 0, truncated = false },
 	assets = { discovered = 0 },
-	server = { recovered = 0 },
 }
 local Assets = {}
 local StableIds = {}
@@ -1085,48 +1080,6 @@ local function collectAllScripts()
 	return list
 end
 
-local function probeNonReplicatedContainers()
-	local rows = {}
-	for _, serviceName in ipairs(NONREPLICATED_CONTAINERS) do
-		local row = {
-			service = serviceName,
-			accessible = false,
-			scripts = 0,
-			instances = 0,
-			note = "diagnostic only — not a server dump",
-		}
-		local ok, svc = pcall(function()
-			return game:GetService(serviceName)
-		end)
-		if not ok or not svc then
-			row.note = "GetService failed (still not a server dump)"
-			table.insert(rows, row)
-			continue
-		end
-		row.accessible = true
-		local okDesc, desc = pcall(function()
-			return svc:GetDescendants()
-		end)
-		if okDesc and type(desc) == "table" then
-			row.instances = #desc
-			for _, inst in ipairs(desc) do
-				if isScript(inst) then
-					row.scripts += 1
-				end
-			end
-			if row.instances > 0 then
-				row.note = "some instances visible to this client; unreplicated source is still unavailable"
-			else
-				row.note = "empty or filtered from the client — expected"
-			end
-		else
-			row.note = "GetDescendants blocked from client — expected"
-		end
-		table.insert(rows, row)
-	end
-	return rows
-end
-
 local function isEmptyDecompile(text)
 	if type(text) ~= "string" then
 		return true
@@ -1728,15 +1681,12 @@ local function scriptContext(entry)
 end
 
 local function writeScriptMetadata()
-	ensureDir(OUT .. "/metadata")
 	ensureDir(OUT .. "/scripts")
 	local payload = {
 		count = #ScriptMeta,
 		items = ScriptMeta,
 	}
-	writeJson("metadata/scripts.json", payload)
 	writeJson("scripts/metadata.json", payload)
-	writeJson("scripts-index.json", ScriptIndex)
 end
 
 dumpOneScript = function(entry)
@@ -1750,8 +1700,6 @@ dumpOneScript = function(entry)
 		isNil = entry.isNil,
 		executionContext = executionContext,
 		visibility = visibility,
-		serverClassInstance = entry.class == "Script",
-		serverOnlyRecovered = false,
 	}
 	local ok, err = pcall(function()
 		local scriptInst = entry.script
@@ -1962,8 +1910,6 @@ dumpOneScript = function(entry)
 					isNil = entry.isNil,
 					executionContext = executionContext,
 					visibility = visibility,
-					serverClassInstance = entry.class == "Script",
-					serverOnlyRecovered = false,
 					complete = sourceForHash ~= nil,
 				})
 			end
@@ -1995,7 +1941,6 @@ local function dumpAllScripts(scriptList)
 	Coverage.scripts.discovered = #scriptList
 	log("boot", string.format("decompiling %d / %d scripts (sequential job queue, threads=%d unused)", total, #scriptList, Config.threads))
 	ensureDir(OUT .. "/scripts")
-	ensureDir(OUT .. "/metadata")
 	writePhase("scripts_start", "total=" .. total)
 	for i = 1, total do
 		local entry = scriptList[i]
@@ -2203,7 +2148,6 @@ writeRemoteCatalog = function()
 		count = #items,
 		items = items,
 	}
-	writeJson("remote-catalog.json", payload)
 	ensureDir(OUT .. "/remotes")
 	writeJson("remotes/catalog.json", payload)
 	local edges = {}
@@ -2250,11 +2194,6 @@ local function dumpRemotes()
 	table.sort(all, function(a, b)
 		return a.path < b.path
 	end)
-	writeJson("remotes-all.json", {
-		count = #all,
-		items = all,
-		note = "channel=network are remotes; channel=bindable are client-local.",
-	})
 	log("done", "remotes=" .. #all)
 end
 
@@ -2606,7 +2545,6 @@ writeAnalysisReport = function()
 		},
 		snapshots = Snap.n,
 		coverage = Coverage,
-		serverOnlyRecovered = 0,
 	})
 end
 
@@ -2644,7 +2582,6 @@ local function writeAssets()
 end
 
 local function writeCoverage()
-	Coverage.server.recovered = 0
 	local remoteDisc, remoteObs = 0, 0
 	for _, rec in pairs(RemoteIndex) do
 		remoteDisc += 1
@@ -2688,7 +2625,6 @@ local function writeCoverage()
 		gui = Coverage.gui,
 		assets = Coverage.assets,
 		runtime = { liveEvents = Live.n, snapshots = Snap.n },
-		server = Coverage.server,
 		capabilities = collectorCapabilities(),
 		note = "percent.instances is serialized/(serialized+failed). Empty class schemas are unschematized, not failed. instanceSchema is serialized/discovered.",
 	})
@@ -2716,7 +2652,6 @@ writeManifest = function()
 			live = "live/events.jsonl",
 			snapshots = "snapshots/",
 			analysis = "analysis/",
-			visibility = "server-visibility.json",
 		},
 		snapshots = Snap.n,
 		scriptsDumped = ScriptsDumped,
@@ -2851,8 +2786,7 @@ flushLiveLogs = function()
 	local flushed = 0
 	if pendingNet ~= "" then
 		local okNet = appendText("live/net.log", pendingNet)
-		local okLive = appendText("net-live.log", pendingNet)
-		if okNet or okLive then
+		if okNet then
 			Live.pendingNet = ""
 		end
 	end
@@ -3260,23 +3194,6 @@ local function installLiveIntercept()
 		return
 	end
 	ensureDir(OUT .. "/live")
-	writeText("live/README.txt", table.concat({
-		"Live intercept — client collector telemetry after dump.lua runs",
-		"",
-		"Files:",
-		"  net.log / net-live.log  — tab-separated remote traffic (append-only)",
-		"  events.jsonl            — unified event records (pending queue flushed then cleared)",
-		"  status.json             — event count + hook status",
-		"",
-		"Event fields: seq, t, clock, dir, remote, class, method, source, args, returns, truncated, thread",
-		"",
-		"C2S = client firing remotes (FireServer / InvokeServer) via __namecall and hookfunction",
-		"S2C = server pushing to you (OnClientEvent; OnClientInvoke callback wrap)",
-		"STAT = leaderstats / health changes",
-		"INST = new remotes or scripts appearing at runtime",
-		"",
-		"OnClientInvoke is a callback property, not an event. This collector wraps it.",
-	}, "\n"))
 	hookAllRemotes()
 	watchLeaderstats()
 	watchCharacter(LocalPlayer.Character)
@@ -3367,39 +3284,6 @@ local function buildOutPath(placeId, placeName)
 	return string.format("%s/%s_%s", Config.mainDir, tostring(placeId), placeName)
 end
 
-local function writeLimitations()
-	writeText("LIMITATIONS.txt", table.concat({
-		"roblox-dumper " .. VERSION .. " — client collector",
-		"================================================",
-		"",
-		"This is a client-side snapshot + telemetry tool.",
-		"It cannot reconstruct unreplicated server source.",
-		"",
-		"CAN dump from a client executor:",
-		"  • LocalScripts, ModuleScripts, and Script instances replicated to this client",
-		"  • Scripts returned by getscripts / getrunningscripts / getloadedmodules",
-		"  • Nil-parented scripts (getnilinstances)",
-		"  • ReplicatedStorage / Workspace / PlayerGui trees (client view)",
-		"  • RemoteEvent / RemoteFunction / UnreliableRemoteEvent instances the client can see",
-		"  • Client→server and server→client traffic the client actually observes",
-		"  • Instance properties (class schemas; set Config.fullProperties for getproperties)",
-		"  • Decompiled source, then a rename pass from GetService/WaitForChild/ClassName/return",
-		"  • Raw bytecode as .luau-bytecode and optional scripts/*.constants.json",
-		"",
-		"CANNOT dump from client alone:",
-		"  • ServerScriptService / ServerStorage scripts that never replicate",
-		"  • Server-only ModuleScripts never required on the client",
-		"  • Server remote handlers and server runtime state",
-		"  • Original local names (Luau bytecode does not store them; uN/vN/pN are decompiler placeholders)",
-		"",
-		"server-visibility.json is a diagnostic of the client view of those containers.",
-		"An empty or filtered tree is expected. It is not a failed server dump.",
-		"",
-		"For an authorized server dump of a place you own, run studio/DumpPlace.lua",
-		"from a Studio plugin (ScriptEditorService:GetEditorSource).",
-	}, "\n"))
-end
-
 local function runPhase(name, fn)
 	Log.phase = name
 	local ok, err = pcall(fn)
@@ -3453,13 +3337,6 @@ local function runAll()
 			RunService:Set3dRenderingEnabled(false)
 		end)
 	end
-	local visibility = {
-		note = "Diagnostic of the client view of non-replicated containers. This is not a server dump.",
-		items = probeNonReplicatedContainers(),
-	}
-	writeJson("server-visibility.json", visibility)
-	writeJson("server-access.json", visibility)
-	writeLimitations()
 	local metaPayload = {
 		at = os.time(),
 		version = VERSION,
@@ -3487,29 +3364,9 @@ local function runAll()
 			httprequest = httpRequest ~= nil,
 		},
 	}
-	writeJson("meta.json", metaPayload)
 	writeJson("metadata.json", metaPayload)
 	local scriptList = collectAllScripts()
-	local serverClassInstances = 0
-	for _, entry in ipairs(scriptList) do
-		if entry.class == "Script" then
-			serverClassInstances += 1
-		end
-	end
-	log("boot", string.format("found %d scripts (%d Script-class visible to client; serverOnlyRecovered=0)", #scriptList, serverClassInstances))
-	writeJson("script-inventory.json", {
-		scriptInstances = #scriptList,
-		serverClassInstances = serverClassInstances,
-		serverOnlyRecovered = 0,
-		note = "serverClassInstances are Script-class objects visible to the client, not recovered ServerScriptService source.",
-		sample = (function()
-			local s = {}
-			for i = 1, math.min(20, #scriptList) do
-				s[i] = { scriptList[i].path, scriptList[i].class, scriptList[i].source, scriptList[i].discovery }
-			end
-			return s
-		end)(),
-	})
+	log("boot", string.format("found %d scripts", #scriptList))
 	if Config.dumpRemotes then
 		runPhase("remotes", dumpRemotes)
 		writePhase("remotes_done")
@@ -3558,12 +3415,10 @@ local function runAll()
 		writes = WriteStats,
 		scriptInstances = #scriptList,
 		scriptsDumped = ScriptsDumped,
-		serverClassInstances = serverClassInstances,
-		serverOnlyRecovered = 0,
 		snapshots = Snap.n,
 		coverage = Coverage,
 		capabilities = collectorCapabilities(),
-		message = "Client dump complete. Keep playing — live/events.jsonl and snapshots/ update while you play. See coverage/report.json.",
+		message = "Dump complete. Keep playing — live/events.jsonl and snapshots/ keep updating.",
 	})
 	writeText("log.txt", table.concat(Log.lines, "\n"))
 	if Config.disableRender then

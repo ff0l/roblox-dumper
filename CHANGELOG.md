@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.4.6
+
+Dropped the fake server tree, `LIMITATIONS.txt`, and duplicate dump files. No `server-visibility.json`, no Studio exporter, no `meta.json` / `script-inventory.json` twins. README describes the collector as it actually runs.
+
 ## 0.4.5
 
 Decompile retries bytecode and the script closure, then a rename pass turns `uN`/`vN` into GetService / WaitForChild / ClassName / module-return names. `string.char` folds. Constants that never appear in the decompiled text are listed. Empty decompiler stubs (`-- Empty bytecode`) are not counted as source. Original identifiers are still not in Luau bytecode.

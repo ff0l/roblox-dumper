@@ -1,79 +1,99 @@
 # roblox-dumper
 
-Client-side Roblox place collector. Instance graph, remotes, GUI, scripts, live telemetry, snapshots, coverage.
+One Lua file that snapshots a Roblox place from an executor: scripts, remotes, instances, GUI, values, and live traffic while you play.
 
-This is a **client collector**, not a server dumper. Unreplicated `ServerScriptService` / `ServerStorage` source is invisible from a normal client. For a place you own, run [`studio/DumpPlace.lua`](studio/DumpPlace.lua) from a Studio plugin (`ScriptEditorService:GetEditorSource`).
+Execute [`dump.lua`](dump.lua). Output lands in the executor workspace under `UniversalDumper/<placeId>_<PlaceName>/`.
 
-One executor file: `dump.lua`. Output goes to `UniversalDumper/[placeId]_PlaceName/` in the executor workspace.
-
-v0.4.5 research tool, not a game script pack.
-
-## What it dumps
-
-- Instance graph: `stableId` / `parentId` plus class-schema properties (`Config.fullProperties` for `getproperties`)
-- RemoteEvent / RemoteFunction / UnreliableRemoteEvent index, alias-aware static refs, `remotes/graph.json`
-- GUI, values, attributes, asset content IDs
-- Scripts named `Name.hash8.lua` plus matching `.luau-bytecode` (hash-shared)
-- Deobfuscation pass: rename `uN`/`vN` from GetService, WaitForChild, ClassName, module return; fold `string.char`; list missing constants
-- `scripts/Name.hash8.constants.json` from `getconstants`
-- Structured Roblox types; unsupported values are marked `lossy`
-- Live C2S / S2C intercept (`OnClientInvoke` is wrapped as a callback, not `:Connect`)
-- Periodic snapshots keyed by stable id, plus `coverage/report.json`
-
-Quiet by default (`Config.debug = false`).
+**v0.4.6**
 
 ## Run
 
 1. Join a place.
-2. Execute `dump.lua`.
-3. Open the folder in `WHERE.txt` / `complete.json`. Keep playing — `snapshots/` and `live/events.jsonl` keep updating.
-4. For a place you own, also run `studio/DumpPlace.lua` in Studio (plugin context). Merge later; do not treat the client dump as a server dump.
+2. Execute `dump.lua` (Potassium, Wave, or any executor with `writefile` / `makefolder`).
+3. Open `WHERE.txt` in that folder when it appears.
+4. Keep playing. `live/events.jsonl` and `snapshots/` keep updating until you leave or unload.
 
-## How it works
+Re-running the same session unloads the previous collector first (`UNIVERSAL_DUMP_UNLOAD`). For a clean folder, delete the old `UniversalDumper/<place>/` directory before you dump again.
 
-```
-capability detection + session metadata
-  → remotes, values, GUI, instance graph, assets
-  → optional live hooks (Config.liveInstallEarly)
-  → sequential script jobs (decompile → deobfuscate → serialize → write)
-  → remote catalog + graph
-  → snapshot 000001 + coverage/report.json
-  → runtime: remotes/scripts, pending event flush, snapshot diffs
-```
+## What you get
 
-Scripts are unioned from `GetDescendants`, `getscripts` / `getrunningscripts` / `getloadedmodules`, and `getnilinstances` if `Config.includeNil` is on. Each script reports a pipeline: discovered → identified → source/bytecode → decompile attempted → reconstruction score.
+**Scripts** — Every LocalScript, ModuleScript, and replicated Script the client can see (`GetDescendants`, `getscripts`, `getloadedmodules`, `getnilinstances`). Each unique bytecode hash becomes one file:
 
-Live C2S uses `__namecall` plus `hookfunction` on `FireServer` / `InvokeServer` when available. S2C RemoteEvents use `OnClientEvent`. RemoteFunctions wrap `OnClientInvoke` and record return values separately (`role = invoke`).
+- `scripts/Name.hash8.lua` — decompiled source, then a rename pass (`GetService`, `WaitForChild`, `ClassName`, module return)
+- `scripts/Name.hash8.luau-bytecode` — raw bytecode
+- `scripts/Name.hash8.constants.json` — `getconstants` on the closure
+- `scripts/metadata.json` — path, hash, confidence, reconstruction score
+
+Identical source shares one pair of files. Confidence is `LOW` / `MEDIUM` / `HIGH` from syntax, proto count, and constant overlap.
+
+**Remotes** — RemoteEvent, RemoteFunction, UnreliableRemoteEvent, plus Bindables. Catalog, static refs from decompiled source, and live C2S/S2C counts.
+
+**Instances** — Workspace, ReplicatedStorage, ReplicatedFirst, StarterGui, StarterPack, LocalPlayer, Lighting. Identity (`stableId`, `parentId`, class, name, path) plus class-schema properties. Full rows in `instances.jsonl`; `trees/*.json` are indexes.
+
+**GUI & values** — PlayerGui / StarterGui objects, ValueBases, and attributes as jsonl.
+
+**Live** — After the first pass, hooks stay on:
+
+| Direction | What |
+|-----------|------|
+| C2S | `FireServer` / `InvokeServer` (`__namecall` + `hookfunction`) |
+| S2C | `OnClientEvent`; `OnClientInvoke` is wrapped as a callback |
+| STAT | leaderstats / health |
+| INST | remotes or scripts that appear later |
+
+**Snapshots** — Up to 10 diffs of remotes, scripts, and leaderstats. No full-tree walk.
 
 ## Output
 
 ```
-UniversalDumper/<place>/
-  manifest.json
-  metadata.json
-  complete.json
-  coverage/report.json
-  LIMITATIONS.txt
-  server-visibility.json
-  instances.jsonl
-  scripts/metadata.json
-  scripts/Name.hash8.lua
-  scripts/Name.hash8.luau-bytecode
-  remotes/catalog.json
-  remotes/graph.json
-  remotes/observations.jsonl
-  assets/catalog.json
+UniversalDumper/<placeId>_<PlaceName>/
+  WHERE.txt                 path to this folder
+  complete.json             summary when the first pass finishes
+  manifest.json             file index, version, placeId
+  metadata.json             session, executor APIs, Config
+  log.txt                   phase log
+  coverage/report.json      discovered vs dumped
+  scripts/
+    metadata.json
+    KnitClient.95245fd0.lua
+    KnitClient.95245fd0.luau-bytecode
+    KnitClient.95245fd0.constants.json
+  remotes/
+    catalog.json            every remote + bindable
+    graph.json              static refs + observed edges
+    observations.jsonl      same events as live, per remote
+  live/
+    events.jsonl            structured traffic
+    net.log                 tab-separated traffic
+    status.json
+  instances.jsonl           one instance per line
+  trees/Workspace.json      index → instances.jsonl
+  gui.jsonl
+  values.jsonl
+  assets/catalog.json       rbxassetid references
   snapshots/000001.json
-  analysis/diffs.jsonl
-  analysis/report.json
-  live/events.jsonl
-  trees/*.json
-  log.txt
+  analysis/
+    report.json
+    diffs.jsonl             counts + a 40-entry sample
 ```
 
-`server-visibility.json` is the client view of non-replicated containers, not a server dump. `serverOnlyRecovered` is always 0 from this collector. `coverage/report.json` is the completeness claim.
+`complete.json` is the first-pass snapshot. Live files keep growing after that.
 
-Trimmed example: [docs/example-output.md](docs/example-output.md)
+## How it works
+
+```
+detect APIs
+  → remotes, values, GUI, instance graph, assets
+  → live hooks (default: before decompile)
+  → decompile each script → rename pass → write .lua + bytecode
+  → remote catalog + graph
+  → snapshot 000001
+  → Heartbeat: flush live events, snapshot diffs
+```
+
+Decompile tries the instance, then the bytecode blob, then the script closure. Empty stubs are not saved as source.
+
+The rename pass maps decompiler names (`u1`, `v3`) from real APIs and types. Parameters like `p9` stay when there is no name to recover — Luau bytecode does not store original locals.
 
 ## Config
 
@@ -81,29 +101,33 @@ Edit the `Config` table at the top of `dump.lua`.
 
 | Key | Default | Meaning |
 |-----|---------|---------|
-| `decompile` | `true` | Call executor decompiler |
-| `deobfuscate` | `true` | Rename decompiler placeholders from APIs/constants |
+| `decompile` | `true` | Call the executor decompiler |
+| `deobfuscate` | `true` | Rename `uN`/`vN` from APIs and types |
 | `dumpScriptConstants` | `true` | Write `scripts/*.constants.json` |
+| `includeBytecode` | `true` | Write `.luau-bytecode` |
+| `includeNil` | `true` | Also scan `getnilinstances` |
 | `maxScripts` | `2000` | Cap on dumped scripts |
-| `maxTreePerRoot` | `60000` | Tree node cap per root |
-| `hookNet` | `true` | Namecall / method hooks after dump |
-| `liveIntercept` | `true` | Record live remote traffic |
-| `liveInstallEarly` | `true` | Install hooks before decompile |
-| `fullProperties` | `false` | Use executor `getproperties` on every instance |
-| `liveFlushEvery` | `8` | Flush pending live events this often |
-| `snapshotDiff` | `true` | Periodic snapshots after the initial dump |
+| `dumpTrees` | `true` | Instance graph |
+| `maxTreePerRoot` | `60000` | Cap per tree root |
+| `fullProperties` | `false` | Use `getproperties` on every instance |
+| `dumpGui` | `true` | PlayerGui / StarterGui |
+| `maxGui` | `20000` | GUI row cap |
+| `dumpValues` | `true` | ValueBases + attributes |
+| `dumpRemotes` | `true` | Remote catalog |
+| `hookNet` | `true` | Install live hooks |
+| `liveIntercept` | `true` | Record C2S / S2C / STAT |
+| `liveInstallEarly` | `true` | Hooks before decompile |
+| `liveFlushEvery` | `8` | Flush pending events this often |
+| `snapshotDiff` | `true` | Periodic snapshots after the first pass |
 | `snapshotEvery` | `20` | Seconds between snapshots |
 | `maxSnapshots` | `10` | Snapshot cap |
-| `debug` | `false` | Console logging |
 | `skipCore` | `true` | Skip CoreGui / Chat / CorePackages |
-| `threads` | `1` | Reserved; decompile stays sequential |
+| `replaceUsername` | `true` | Redact your username in paths |
+| `timeout` | `6` | Seconds per script decompile |
+| `debug` | `false` | Console logging |
 
-Need `writefile` + `makefolder` to save. Everything else degrades: missing `decompile` means stubs or bytecode files.
-
-## Limits
-
-Client dump only. An empty `ServerScriptService` / `ServerStorage` tree is expected. See `LIMITATIONS.txt`. Luau bytecode does not store original local names; the deobfuscate pass is heuristic rename, not recovered source. Static remotes are still a text scan (alias-aware), not a full Luau AST.
+You need `writefile` and `makefolder`. Missing `decompile` still writes bytecode files when `getscriptbytecode` exists.
 
 ## License
 
-Reuse is fine. Give credit — keep ff0l and a link to this repo somewhere obvious. See [LICENSE](LICENSE).
+Reuse is fine. Keep **ff0l** and a link to [github.com/ff0l/roblox-dumper](https://github.com/ff0l/roblox-dumper) somewhere obvious. See [LICENSE](LICENSE).
