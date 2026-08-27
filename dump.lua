@@ -21,7 +21,7 @@ if type(env) == "table" and type(env.UNIVERSAL_DUMP_UNLOAD) == "function" then
 	pcall(env.UNIVERSAL_DUMP_UNLOAD)
 end
 
-local VERSION = "0.4.3"
+local VERSION = "0.4.4"
 local Config = {
 	mainDir = "UniversalDumper",
 	debug = false,
@@ -1883,14 +1883,22 @@ end
 local function dumpValues()
 	Log.phase = "values"
 	local rows = {}
+	local seen = {}
 	local roots = { ReplicatedStorage, Workspace, LocalPlayer, StarterGui, StarterPack, Lighting }
 	for _, root in ipairs(roots) do
 		if root then
 			for _, inst in ipairs(root:GetDescendants()) do
+				local sid = stableIdOf(inst)
+				if sid and seen[sid] then
+					continue
+				end
+				if sid then
+					seen[sid] = true
+				end
 				if inst:IsA("ValueBase") then
 					local row = {
 						path = replacePlayerName(instancePath(inst)),
-						stableId = stableIdOf(inst),
+						stableId = sid,
 						class = inst.ClassName,
 						name = inst.Name,
 					}
@@ -1903,6 +1911,7 @@ local function dumpValues()
 					if attrs and next(attrs) then
 						table.insert(rows, {
 							path = replacePlayerName(instancePath(inst)),
+							stableId = sid,
 							class = inst.ClassName,
 							attributes = serializeValue(attrs),
 						})
@@ -2064,88 +2073,39 @@ local function fingerprintSig(value)
 	return enc and fnv1aHex(enc) or "?"
 end
 
-local function snapshotRoots()
-	return { Workspace, ReplicatedStorage, ReplicatedFirst, StarterGui, StarterPack, LocalPlayer, Lighting }
-end
-
 local function captureSnapshotState()
-	local remotes, scripts, values, gui, attrs, props = {}, {}, {}, {}, {}, {}
-	local n = 0
-	for _, root in ipairs(snapshotRoots()) do
-		if not root then
-			continue
+	local remotes, scripts, values = {}, {}, {}
+	for path, rec in pairs(RemoteIndex) do
+		if rec.channel == "network" then
+			local key = rec.stableId or path
+			remotes[key] = {
+				path = path,
+				class = rec.class,
+				c2s = rec.stats and rec.stats.c2s or 0,
+				s2c = rec.stats and rec.stats.s2c or 0,
+			}
 		end
-		local ok, desc = pcall(function()
-			return root:GetDescendants()
-		end)
-		if not ok or type(desc) ~= "table" then
-			continue
-		end
-		for _, inst in ipairs(desc) do
-			n += 1
-			if n % 400 == 0 then
-				task.wait()
-			end
-			local path = replacePlayerName(instancePath(inst))
-			local sid = stableIdOf(inst) or path
-			if isNetworkRemote(inst) then
-				local rec = RemoteIndex[path]
-				remotes[sid] = {
-					path = path,
-					class = inst.ClassName,
-					c2s = rec and rec.stats.c2s or 0,
-					s2c = rec and rec.stats.s2c or 0,
-				}
-			elseif isScript(inst) and not isIgnored(inst) then
-				scripts[sid] = {
-					path = path,
-					class = inst.ClassName,
-					name = inst.Name,
-					hash = ScriptHashById[sid] or ScriptHashByPath[instancePath(inst)] or ScriptHashByPath[path],
-				}
-			elseif inst:IsA("ValueBase") then
+	end
+	for _, meta in ipairs(ScriptMeta) do
+		local key = meta.stableId or meta.path
+		scripts[key] = {
+			path = meta.path,
+			class = meta.class,
+			name = meta.name or meta.path,
+			hash = meta.hash or meta.contentHash,
+		}
+	end
+	local stats = LocalPlayer and LocalPlayer:FindFirstChild("leaderstats")
+	if stats then
+		for _, inst in ipairs(stats:GetChildren()) do
+			if inst:IsA("ValueBase") then
+				local path = replacePlayerName(instancePath(inst))
+				local sid = stableIdOf(inst) or path
 				local ser = nil
 				pcall(function()
 					ser = serializeValue(inst.Value)
 				end)
 				values[sid] = { path = path, sig = fingerprintSig(ser) }
-			elseif inst:IsA("GuiObject") then
-				gui[sid] = { path = path, class = inst.ClassName, visible = inst.Visible }
-			end
-			if inst:IsA("BasePart") then
-				local okp, cf, sz = pcall(function()
-					return tostring(inst.CFrame), tostring(inst.Size)
-				end)
-				if okp then
-					props[sid] = { path = path, class = inst.ClassName, sig = cf .. "|" .. sz }
-				end
-			elseif inst:IsA("Humanoid") then
-				local okp, hs, ws = pcall(function()
-					return inst.Health, inst.WalkSpeed
-				end)
-				if okp then
-					props[sid] = { path = path, class = inst.ClassName, sig = tostring(hs) .. "|" .. tostring(ws) }
-				end
-			elseif inst:IsA("Sound") then
-				props[sid] = { path = path, class = inst.ClassName, playing = inst.Playing }
-			elseif inst:IsA("Tool") then
-				props[sid] = { path = path, class = inst.ClassName, enabled = inst.Enabled }
-			elseif inst:IsA("GuiObject") then
-				props[sid] = { path = path, class = inst.ClassName, visible = inst.Visible }
-			end
-			if Config.dumpAttributes then
-				local a = inst:GetAttributes()
-				if a and next(a) then
-					attrs[sid] = { path = path, sig = fingerprintSig(serializeValue(a)) }
-				end
-			end
-		end
-	end
-	for path, rec in pairs(RemoteIndex) do
-		if rec.channel == "network" then
-			local key = rec.stableId or path
-			if not remotes[key] then
-				remotes[key] = { path = path, class = rec.class, c2s = rec.stats.c2s, s2c = rec.stats.s2c }
 			end
 		end
 	end
@@ -2153,34 +2113,76 @@ local function captureSnapshotState()
 		remotes = remotes,
 		scripts = scripts,
 		values = values,
-		gui = gui,
-		attrs = attrs,
-		props = props,
+		gui = {},
+		attrs = {},
+		props = {},
 	}
+end
+
+local DIFF_SAMPLE = 40
+
+local function entrySig(v)
+	if type(v) ~= "table" then
+		return tostring(v)
+	end
+	if v.sig ~= nil then
+		return tostring(v.sig)
+	end
+	if v.hash ~= nil then
+		return tostring(v.hash)
+	end
+	if v.c2s ~= nil or v.s2c ~= nil then
+		return tostring(v.c2s or 0) .. ":" .. tostring(v.s2c or 0)
+	end
+	return fingerprintSig(v)
 end
 
 local function mapDiff(oldMap, newMap)
 	local added, removed, changed = {}, {}, {}
 	oldMap = oldMap or {}
 	newMap = newMap or {}
-	for path, nv in pairs(newMap) do
-		local ov = oldMap[path]
+	local addedN, removedN, changedN = 0, 0, 0
+	for key, nv in pairs(newMap) do
+		local ov = oldMap[key]
 		if ov == nil then
-			table.insert(added, path)
+			addedN += 1
+			if #added < DIFF_SAMPLE then
+				table.insert(added, type(nv) == "table" and (nv.path or key) or key)
+			end
 		else
-			local osig = type(ov) == "table" and (jsonEncode(ov) or fingerprintSig(ov)) or tostring(ov)
-			local nsig = type(nv) == "table" and (jsonEncode(nv) or fingerprintSig(nv)) or tostring(nv)
+			local osig = entrySig(ov)
+			local nsig = entrySig(nv)
 			if osig ~= nsig then
-				table.insert(changed, { path = path, before = ov, after = nv })
+				changedN += 1
+				if #changed < DIFF_SAMPLE then
+					local path = type(nv) == "table" and (nv.path or key) or key
+					table.insert(changed, { path = path, before = osig, after = nsig })
+				end
 			end
 		end
 	end
-	for path in pairs(oldMap) do
-		if newMap[path] == nil then
-			table.insert(removed, path)
+	for key in pairs(oldMap) do
+		if newMap[key] == nil then
+			removedN += 1
+			if #removed < DIFF_SAMPLE then
+				local ov = oldMap[key]
+				table.insert(removed, type(ov) == "table" and (ov.path or key) or key)
+			end
 		end
 	end
-	return added, removed, changed
+	return {
+		n = addedN,
+		truncated = addedN > DIFF_SAMPLE,
+		sample = added,
+	}, {
+		n = removedN,
+		truncated = removedN > DIFF_SAMPLE,
+		sample = removed,
+	}, {
+		n = changedN,
+		truncated = changedN > DIFF_SAMPLE,
+		sample = changed,
+	}
 end
 
 writeAnalysisReport = function()
@@ -2281,8 +2283,15 @@ local function writeCoverage()
 	end
 	local instDenom = Coverage.instances.discovered
 	local instCov = 0
+	local schematized = Coverage.instances.serialized + Coverage.instances.failed
+	if schematized > 0 then
+		instCov = Coverage.instances.serialized / schematized
+	elseif instDenom > 0 then
+		instCov = 1
+	end
+	local schemaCov = 0
 	if instDenom > 0 then
-		instCov = Coverage.instances.serialized / instDenom
+		schemaCov = Coverage.instances.serialized / instDenom
 	end
 	writeJson("coverage/report.json", {
 		schema = "roblox-dumper/coverage-v1",
@@ -2291,6 +2300,7 @@ local function writeCoverage()
 		mode = "client",
 		percent = {
 			instances = instCov,
+			instanceSchema = schemaCov,
 			scripts = scriptCov,
 		},
 		instances = Coverage.instances,
@@ -2301,7 +2311,7 @@ local function writeCoverage()
 		runtime = { liveEvents = Live.n, snapshots = Snap.n },
 		server = Coverage.server,
 		capabilities = collectorCapabilities(),
-		note = "Client coverage of replicated state only. server.recovered is always 0 here.",
+		note = "percent.instances is serialized/(serialized+failed). Empty class schemas are unschematized, not failed. instanceSchema is serialized/discovered.",
 	})
 end
 
@@ -2383,7 +2393,7 @@ takeSnapshot = function()
 			at = rec.at,
 			clock = rec.clock,
 			counts = rec.counts,
-			note = "Full maps stay in memory for diffs.",
+			note = "Snapshot is remotes/scripts/leaderstats from in-memory indexes. No descendant walk.",
 		})
 		if Snap.last then
 			local prev = Snap.last

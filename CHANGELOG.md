@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.4.4
+
+Snapshots no longer walk 70k descendants. They diff in-memory remotes/scripts plus leaderstats. Diff lines are counts plus a 40-entry sample, not 150KB of moving-part CFrames. Coverage `percent.instances` is serialized/(serialized+failed); empty schemas stay in `unschematized`.
+
 ## 0.4.3
 
 Snapshot overlap. `captureSnapshotState` yields, so Heartbeat started another snapshot before `maxSnapshots` was applied. Reserve the slot and set `Snap.busy` before the walk. Empty class-schema rows are `unschematized`, not `failed`.
