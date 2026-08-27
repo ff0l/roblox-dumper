@@ -21,7 +21,7 @@ if type(env) == "table" and type(env.UNIVERSAL_DUMP_UNLOAD) == "function" then
 	pcall(env.UNIVERSAL_DUMP_UNLOAD)
 end
 
-local VERSION = "0.4.2"
+local VERSION = "0.4.3"
 local Config = {
 	mainDir = "UniversalDumper",
 	debug = false,
@@ -144,9 +144,9 @@ local ScriptMeta = {}
 local HashUsed = {}
 local BytecodeWritten = {}
 local ScriptIndex = { totalFound = 0, dumped = 0, failed = 0, timedOut = 0, items = {} }
-local Snap = { n = 0, last = nil, lastAt = 0 }
+local Snap = { n = 0, last = nil, lastAt = 0, busy = false }
 local Coverage = {
-	instances = { discovered = 0, serialized = 0, failed = 0, truncated = false },
+	instances = { discovered = 0, serialized = 0, failed = 0, unschematized = 0, truncated = false },
 	scripts = { discovered = 0, decompiled = 0, bytecode_only = 0, failed = 0, syntaxValid = 0 },
 	remotes = { discovered = 0, observed = 0 },
 	gui = { discovered = 0, serialized = 0, truncated = false },
@@ -1996,10 +1996,12 @@ local function dumpTree(root, label)
 		row.tags = readTags(inst)
 		row.attributes = readAttributes(inst)
 		Coverage.instances.discovered += 1
-		if complete or (props and next(props)) then
+		if complete then
+			Coverage.instances.serialized += 1
+		elseif props and next(props) then
 			Coverage.instances.serialized += 1
 		else
-			Coverage.instances.failed += 1
+			Coverage.instances.unschematized += 1
 		end
 		if inst:IsA("ValueBase") then
 			pcall(function()
@@ -2337,70 +2339,77 @@ takeSnapshot = function()
 	if not Config.snapshotDiff or OUT == "" then
 		return
 	end
-	if Snap.n >= Config.maxSnapshots then
+	if Snap.busy or Snap.n >= Config.maxSnapshots then
 		return
 	end
-	local state = captureSnapshotState()
+	Snap.busy = true
 	Snap.n += 1
 	local id = Snap.n
-	local rec = {
-		id = id,
-		at = os.time(),
-		clock = os.clock(),
-		counts = { remotes = 0, scripts = 0, values = 0, gui = 0, attrs = 0, props = 0 },
-		remotes = state.remotes,
-		scripts = state.scripts,
-		values = state.values,
-		gui = state.gui,
-		attrs = state.attrs,
-		props = state.props,
-	}
-	for _ in pairs(state.remotes) do
-		rec.counts.remotes += 1
-	end
-	for _ in pairs(state.scripts) do
-		rec.counts.scripts += 1
-	end
-	for _ in pairs(state.values) do
-		rec.counts.values += 1
-	end
-	for _ in pairs(state.gui) do
-		rec.counts.gui += 1
-	end
-	for _ in pairs(state.attrs) do
-		rec.counts.attrs += 1
-	end
-	for _ in pairs(state.props or {}) do
-		rec.counts.props += 1
-	end
-	ensureDir(OUT .. "/snapshots")
-	writeJson(string.format("snapshots/%06d.json", id), {
-		id = id,
-		at = rec.at,
-		clock = rec.clock,
-		counts = rec.counts,
-		note = "Full maps stay in memory for diffs.",
-	})
-	if Snap.last then
-		local prev = Snap.last
-		local diff = { from = prev.id, to = id, at = rec.at }
-		diff.remotesAdded, diff.remotesRemoved, diff.remotesChanged = mapDiff(prev.remotes, rec.remotes)
-		diff.scriptsAdded, diff.scriptsRemoved, diff.scriptsChanged = mapDiff(prev.scripts, rec.scripts)
-		diff.valuesAdded, diff.valuesRemoved, diff.valuesChanged = mapDiff(prev.values, rec.values)
-		diff.guiAdded, diff.guiRemoved, diff.guiChanged = mapDiff(prev.gui, rec.gui)
-		diff.attrsAdded, diff.attrsRemoved, diff.attrsChanged = mapDiff(prev.attrs, rec.attrs)
-		diff.propsAdded, diff.propsRemoved, diff.propsChanged = mapDiff(prev.props, rec.props)
-		local encoded = jsonEncode(diff)
-		if encoded then
-			appendText("analysis/diffs.jsonl", encoded .. "\n")
+	local ok, err = pcall(function()
+		local state = captureSnapshotState()
+		local rec = {
+			id = id,
+			at = os.time(),
+			clock = os.clock(),
+			counts = { remotes = 0, scripts = 0, values = 0, gui = 0, attrs = 0, props = 0 },
+			remotes = state.remotes,
+			scripts = state.scripts,
+			values = state.values,
+			gui = state.gui,
+			attrs = state.attrs,
+			props = state.props,
+		}
+		for _ in pairs(state.remotes) do
+			rec.counts.remotes += 1
 		end
+		for _ in pairs(state.scripts) do
+			rec.counts.scripts += 1
+		end
+		for _ in pairs(state.values) do
+			rec.counts.values += 1
+		end
+		for _ in pairs(state.gui) do
+			rec.counts.gui += 1
+		end
+		for _ in pairs(state.attrs) do
+			rec.counts.attrs += 1
+		end
+		for _ in pairs(state.props or {}) do
+			rec.counts.props += 1
+		end
+		ensureDir(OUT .. "/snapshots")
+		writeJson(string.format("snapshots/%06d.json", id), {
+			id = id,
+			at = rec.at,
+			clock = rec.clock,
+			counts = rec.counts,
+			note = "Full maps stay in memory for diffs.",
+		})
+		if Snap.last then
+			local prev = Snap.last
+			local diff = { from = prev.id, to = id, at = rec.at }
+			diff.remotesAdded, diff.remotesRemoved, diff.remotesChanged = mapDiff(prev.remotes, rec.remotes)
+			diff.scriptsAdded, diff.scriptsRemoved, diff.scriptsChanged = mapDiff(prev.scripts, rec.scripts)
+			diff.valuesAdded, diff.valuesRemoved, diff.valuesChanged = mapDiff(prev.values, rec.values)
+			diff.guiAdded, diff.guiRemoved, diff.guiChanged = mapDiff(prev.gui, rec.gui)
+			diff.attrsAdded, diff.attrsRemoved, diff.attrsChanged = mapDiff(prev.attrs, rec.attrs)
+			diff.propsAdded, diff.propsRemoved, diff.propsChanged = mapDiff(prev.props, rec.props)
+			local encoded = jsonEncode(diff)
+			if encoded then
+				appendText("analysis/diffs.jsonl", encoded .. "\n")
+			end
+		end
+		Snap.last = rec
+		Snap.lastAt = os.clock()
+		pcall(writeManifest)
+		pcall(writeAnalysisReport)
+		pcall(writeCoverage)
+		log("done", string.format("snapshot %06d remotes=%d scripts=%d values=%d", id, rec.counts.remotes, rec.counts.scripts, rec.counts.values))
+	end)
+	Snap.busy = false
+	if not ok then
+		dbgWarn("snapshot failed", err)
 	end
-	Snap.last = rec
-	Snap.lastAt = os.clock()
-	pcall(writeManifest)
-	pcall(writeAnalysisReport)
-	pcall(writeCoverage)
-	log("done", string.format("snapshot %06d remotes=%d scripts=%d values=%d", id, rec.counts.remotes, rec.counts.scripts, rec.counts.values))
 end
 
 --[=[ live intercept ]=]
@@ -2938,7 +2947,7 @@ local function installLiveIntercept()
 				end
 			end
 		end
-		if Config.snapshotDiff and Snap.n > 0 and Snap.n < Config.maxSnapshots then
+		if Config.snapshotDiff and not Snap.busy and Snap.n > 0 and Snap.n < Config.maxSnapshots then
 			if (os.clock() - Snap.lastAt) > Config.snapshotEvery then
 				pcall(takeSnapshot)
 			end

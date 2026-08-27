@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.4.3
+
+Snapshot overlap. `captureSnapshotState` yields, so Heartbeat started another snapshot before `maxSnapshots` was applied. Reserve the slot and set `Snap.busy` before the walk. Empty class-schema rows are `unschematized`, not `failed`.
+
 ## 0.4.2
 
 Readable script files and live I/O that does not stall the client.
