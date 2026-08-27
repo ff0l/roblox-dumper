@@ -6,7 +6,7 @@ This is a **client collector**, not a server dumper. Unreplicated `ServerScriptS
 
 One executor file: `dump.lua`. Output goes to `UniversalDumper/[placeId]_PlaceName/` in the executor workspace.
 
-v0.4.0 research tool, not a game script pack.
+v0.4.1 research tool, not a game script pack.
 
 ## What it dumps
 

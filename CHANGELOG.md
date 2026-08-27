@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.1
+
+Potassium client runtime fixes. UniqueId is all zeros on this client, so it is not identity.
+
+- Script discovery is keyed by Instance, not UniqueId. GetDebugId is used when UniqueId is the nil UUID.
+- Large tree/GUI payloads stay in jsonl. `trees/*.json` is an index; HttpService cannot encode 20k+ property graphs.
+- Non-finite numbers are marked lossy so JSONEncode does not fail the whole file.
+
 ## 0.4.0
 
 Evidence/coverage collector. Still one executor file for clients. Still not a server dump.

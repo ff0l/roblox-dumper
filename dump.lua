@@ -21,7 +21,7 @@ if type(env) == "table" and type(env.UNIVERSAL_DUMP_UNLOAD) == "function" then
 	pcall(env.UNIVERSAL_DUMP_UNLOAD)
 end
 
-local VERSION = "0.4.0"
+local VERSION = "0.4.1"
 local Config = {
 	mainDir = "UniversalDumper",
 	debug = false,
@@ -390,7 +390,7 @@ local function probeFilesystem()
 			dbgWarn("listfiles failed:", files)
 		end
 	end
-	dbg("disk root (Wave):", DISK_ROOT)
+	dbg("disk root:", DISK_ROOT ~= "" and DISK_ROOT or "(executor workspace relative)")
 	return true
 end
 
@@ -428,19 +428,33 @@ local function getFullNameForScript(inst)
 	return path
 end
 
+local function finiteNumber(n)
+	if type(n) ~= "number" or n ~= n or n == math.huge or n == -math.huge then
+		return { type = "nonfinite", representation = tostring(n), lossy = true }
+	end
+	return n
+end
+
+local NIL_UNIQUE_ID = "00000000-0000-0000-0000-000000000000"
+
+local UniqueIdOwner = {}
 local function instanceUniqueId(inst)
 	local id = nil
 	pcall(function()
 		id = inst.UniqueId
 	end)
-	if type(id) == "string" and id ~= "" then
-		return id
+	if type(id) == "string" and id ~= "" and id ~= NIL_UNIQUE_ID then
+		local owner = UniqueIdOwner[id]
+		if owner == nil or owner == inst then
+			UniqueIdOwner[id] = inst
+			return id
+		end
 	end
 	pcall(function()
 		id = inst:GetDebugId()
 	end)
 	if type(id) == "string" and id ~= "" then
-		return id
+		return "dbg:" .. id
 	end
 	return nil
 end
@@ -607,13 +621,13 @@ end
 
 --[=[ serializer ]=]
 local function serializeVector3(v)
-	return { type = "Vector3", x = v.X, y = v.Y, z = v.Z }
+	return { type = "Vector3", x = finiteNumber(v.X), y = finiteNumber(v.Y), z = finiteNumber(v.Z) }
 end
 local function serializeVector2(v)
-	return { type = "Vector2", x = v.X, y = v.Y }
+	return { type = "Vector2", x = finiteNumber(v.X), y = finiteNumber(v.Y) }
 end
 local function serializeColor3(v)
-	return { type = "Color3", r = v.R, g = v.G, b = v.B }
+	return { type = "Color3", r = finiteNumber(v.R), g = finiteNumber(v.G), b = finiteNumber(v.B) }
 end
 
 serializeValue = function(value, depth, seen, trunc)
@@ -627,8 +641,10 @@ serializeValue = function(value, depth, seen, trunc)
 	local t = typeof(value)
 	if t == "nil" then
 		return { type = "nil" }
-	elseif t == "boolean" or t == "number" then
+	elseif t == "boolean" then
 		return value
+	elseif t == "number" then
+		return finiteNumber(value)
 	elseif t == "string" then
 		if #value > SERIAL_CAPS.stringMax then
 			trunc.stringMax = (trunc.stringMax or 0) + 1
@@ -656,18 +672,18 @@ serializeValue = function(value, depth, seen, trunc)
 		local x, y, z, r00, r01, r02, r10, r11, r12, r20, r21, r22 = value:GetComponents()
 		return {
 			type = "CFrame",
-			x = x,
-			y = y,
-			z = z,
-			r00 = r00,
-			r01 = r01,
-			r02 = r02,
-			r10 = r10,
-			r11 = r11,
-			r12 = r12,
-			r20 = r20,
-			r21 = r21,
-			r22 = r22,
+			x = finiteNumber(x),
+			y = finiteNumber(y),
+			z = finiteNumber(z),
+			r00 = finiteNumber(r00),
+			r01 = finiteNumber(r01),
+			r02 = finiteNumber(r02),
+			r10 = finiteNumber(r10),
+			r11 = finiteNumber(r11),
+			r12 = finiteNumber(r12),
+			r20 = finiteNumber(r20),
+			r21 = finiteNumber(r21),
+			r22 = finiteNumber(r22),
 		}
 	elseif t == "Color3" then
 		return serializeColor3(value)
@@ -968,10 +984,7 @@ local function addScript(set, list, inst, sourceTag)
 	if not isScript(inst) or isIgnored(inst) then
 		return
 	end
-	local path = instancePath(inst)
-	local sid = stableIdOf(inst)
-	local key = sid or path
-	local existing = set[key]
+	local existing = set[inst]
 	if existing then
 		for _, tag in ipairs(existing.discovery) do
 			if tag == sourceTag then
@@ -981,6 +994,8 @@ local function addScript(set, list, inst, sourceTag)
 		table.insert(existing.discovery, sourceTag)
 		return
 	end
+	local path = instancePath(inst)
+	local sid = stableIdOf(inst)
 	local entry = {
 		script = inst,
 		path = path,
@@ -990,7 +1005,7 @@ local function addScript(set, list, inst, sourceTag)
 		discovery = { sourceTag },
 		isNil = not inst:IsDescendantOf(game),
 	}
-	set[key] = entry
+	set[inst] = entry
 	table.insert(list, entry)
 end
 
@@ -1873,12 +1888,26 @@ local function dumpGui()
 	end
 	scan(LocalPlayer:FindFirstChild("PlayerGui"), "PlayerGui")
 	scan(StarterGui, "StarterGui")
-	writeJson("gui-full.json", { count = #rows, items = rows })
+	writeText("gui.jsonl", "")
+	for _, row in ipairs(rows) do
+		local line = jsonEncode(row)
+		if line then
+			appendText("gui.jsonl", line .. "\n")
+		end
+	end
+	if not writeJson("gui-full.json", { count = #rows, items = rows }) then
+		writeJson("gui-full.json", {
+			count = #rows,
+			jsonl = "gui.jsonl",
+			truncated = Coverage.gui.truncated,
+			note = "Items omitted; HttpService JSONEncode failed. See gui.jsonl.",
+		})
+	end
 	log("done", "gui=" .. #rows)
 end
 
 local function dumpTree(root, label)
-	local rows = {}
+	local kept = 0
 	local n = 0
 	for _, inst in ipairs(root:GetDescendants()) do
 		n += 1
@@ -1907,7 +1936,7 @@ local function dumpTree(root, label)
 				row.value = serializeValue(inst.Value)
 			end)
 		end
-		table.insert(rows, row)
+		kept += 1
 		local line = jsonEncode({
 			root = label,
 			stableId = row.stableId,
@@ -1925,8 +1954,14 @@ local function dumpTree(root, label)
 			appendText("instances.jsonl", line .. "\n")
 		end
 	end
-	writeJson("trees/" .. label .. ".json", { root = label, count = #rows, items = rows })
-	log("done", "tree " .. label .. "=" .. #rows)
+	writeJson("trees/" .. label .. ".json", {
+		root = label,
+		count = kept,
+		jsonl = "instances.jsonl",
+		complete = not Coverage.instances.truncated,
+		note = "Full property records are in instances.jsonl. This file is an index (HttpService cannot encode huge trees).",
+	})
+	log("done", "tree " .. label .. "=" .. kept)
 end
 
 local function dumpTrees()
@@ -2253,7 +2288,15 @@ takeSnapshot = function()
 		rec.counts.props += 1
 	end
 	ensureDir(OUT .. "/snapshots")
-	writeJson(string.format("snapshots/%06d.json", id), rec)
+	if not writeJson(string.format("snapshots/%06d.json", id), rec) then
+		writeJson(string.format("snapshots/%06d.json", id), {
+			id = id,
+			at = rec.at,
+			clock = rec.clock,
+			counts = rec.counts,
+			note = "Full maps kept in memory for diffs; HttpService JSONEncode cannot hold this checkpoint.",
+		})
+	end
 	if Snap.last then
 		local prev = Snap.last
 		local diff = { from = prev.id, to = id, at = rec.at }
