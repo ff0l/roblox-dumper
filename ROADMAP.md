@@ -1,6 +1,6 @@
 # Roadmap
 
-v0.2 is a client collector in one executor file. These are the next components, not part of this tag.
+v0.3 is a client collector with snapshots and a formal output layout, still in one executor file.
 
 ## Studio collector (authorized places)
 
@@ -17,14 +17,14 @@ Intended surface:
 
 ## Offline analyzer
 
-Correlate client (and later Studio) artifacts without running in-game:
+Correlate client (and later Studio) artifacts without running in-game. v0.3 already writes `analysis/diffs.jsonl` and `remotes/catalog.json`; a viewer would consume those:
 
-- Script index and content-addressed diffs
 - Remote graph (instance ↔ scripts ↔ observed C2S/S2C)
 - Dependency graph
 - Timeline / snapshot viewer
+- Dedicated Luau bytecode pipeline (opcodes, prototypes, CFG)
 
-A dedicated Luau bytecode pipeline (opcodes, prototypes, constants, CFG) belongs here, not inside `dump.lua`. References: [luau-lang/luau Bytecode.h](https://github.com/luau-lang/luau/blob/master/Common/include/Luau/Bytecode.h), [PumbaaDev/luau-decompiler](https://github.com/PumbaaDev/luau-decompiler), [xgladius/luauDec](https://github.com/xgladius/luauDec).
+References: [luau-lang/luau Bytecode.h](https://github.com/luau-lang/luau/blob/master/Common/include/Luau/Bytecode.h), [PumbaaDev/luau-decompiler](https://github.com/PumbaaDev/luau-decompiler).
 
 ## Target layout (later)
 

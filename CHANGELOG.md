@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.3.0
+
+Snapshot/diff collector. Still one executor file. Still not a server dump.
+
+### Accuracy
+
+- Table serializer unmarks after recursion, so shared tables are not reported as cycles. Non-string keys are kept as `{k, v}` entries.
+- Static remote hits are `{script, line, expression, method, confidence}`, merged onto matching instances. Catalog confidence is high when an instance is also observed at runtime.
+- Scripts report a pipeline (`discovered` → `validated`) with discovery tags, bytecode availability, and `loadstring` syntax validation.
+- Script hash changes after the initial dump write a new version instead of being ignored.
+- `server-visibility.json` replaces the “server dump” naming. Counts are `scriptInstances`, `serverClassInstances`, `serverOnlyRecovered` (always 0 here).
+
+### Snapshots and schema
+
+- Initial snapshot after dump, then periodic diffs (`snapshots/00000N.json`, `analysis/diffs.jsonl`).
+- `manifest.json` describes the output layout. Canonical paths: `scripts/metadata.json`, `remotes/catalog.json`, `remotes/observations.jsonl`, `instances.jsonl`, `analysis/report.json`.
+- Live events distinguish RemoteEvent (`role=event`) from RemoteFunction (`role=invoke`).
+
 ## 0.2.0
 
 Client collector correctness. This is still one executor file (`dump.lua`). It does not dump unreplicated server source.

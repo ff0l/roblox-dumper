@@ -1,91 +1,83 @@
 # Example dump output
 
-Trimmed example of what a completed v0.2 client dump looks like. Real dumps are larger.
+Trimmed example of a v0.3 client dump. Real dumps are larger.
 
 ```
 UniversalDumper/13772394625_BladeBall/
-  meta.json
+  manifest.json
+  metadata.json
   complete.json
   LIMITATIONS.txt
+  server-visibility.json
   script-inventory.json
-  scripts-index.json
-  metadata/scripts.json
-  remotes-all.json
-  remote-catalog.json
-  values-all.json
-  gui-full.json
-  trees/Workspace.json
-  trees/ReplicatedStorage.json
-  trees/PlayerGui.json
+  instances.jsonl
+  scripts/metadata.json
   scripts/a1b2c3d4e5f60789.lua
+  remotes/catalog.json
+  remotes/observations.jsonl
+  snapshots/000001.json
+  snapshots/000002.json
+  analysis/diffs.jsonl
+  analysis/report.json
   live/events.jsonl
-  live/net.log
-  live/status.json
+  trees/ReplicatedStorage.json
   log.txt
 ```
 
-`meta.json` (shape):
+`manifest.json` (shape):
 
 ```json
 {
-  "version": "0.2.0",
+  "schema": "roblox-dumper/v0.3",
+  "version": "0.3.0",
   "mode": "client",
-  "placeId": 13772394625,
-  "placeName": "BladeBall",
-  "executor": { "name": "Wave", "version": "" },
-  "apis": {
-    "decompile": true,
-    "getscripts": true,
-    "getnilinstances": true,
-    "hookmetamethod": true,
-    "hookfunction": true
+  "files": {
+    "scripts": "scripts/metadata.json",
+    "remotes": "remotes/catalog.json",
+    "instances": "instances.jsonl",
+    "snapshots": "snapshots/"
   }
 }
 ```
 
-`metadata/scripts.json` item (shape):
+Script metadata item (shape):
 
 ```json
 {
   "path": "ReplicatedStorage.Shared.Net",
   "class": "ModuleScript",
   "hash": "a1b2c3d4e5f60789",
-  "file": "scripts/a1b2c3d4e5f60789.lua",
+  "discovery": ["descendants", "getloadedmodules"],
   "decompile": "decompiled",
   "syntax": "valid",
-  "confidence": "high"
+  "validation": "passed",
+  "confidence": "high",
+  "versions": 1,
+  "serverOnlyRecovered": false
 }
 ```
 
-`remote-catalog.json` item (shape):
+Remote catalog item (shape):
 
 ```json
 {
   "path": "ReplicatedStorage.Network.Inventory.Update",
   "class": "RemoteEvent",
   "channel": "network",
-  "refs": { "instance": true, "static": ["ReplicatedStorage.Shared.Net"], "runtime": true },
-  "stats": { "c2s": 184, "s2c": 173 },
-  "argSchema": ["table"]
+  "confidence": "high",
+  "refs": {
+    "instance": true,
+    "runtime": true,
+    "static": [
+      { "script": "ReplicatedStorage.Shared.Net", "line": 184, "method": "FireServer", "confidence": "medium" }
+    ]
+  },
+  "stats": { "c2s": 193, "s2c": 181 }
 }
 ```
 
-Live argument example (structured, not `tostring`):
+Live argument example:
 
 ```json
 { "type": "Vector3", "x": 0, "y": 5, "z": 10 }
-```
-
-`complete.json` (shape):
-
-```json
-{
-  "ok": true,
-  "version": "0.2.0",
-  "mode": "client",
-  "output": "UniversalDumper/13772394625_BladeBall",
-  "scriptsFound": 412,
-  "scriptsDumped": 380,
-  "message": "Client dump complete. Keep playing — live/events.jsonl captures observed remotes."
-}
 ```

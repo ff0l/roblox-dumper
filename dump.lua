@@ -21,7 +21,7 @@ if type(env) == "table" and type(env.UNIVERSAL_DUMP_UNLOAD) == "function" then
 	pcall(env.UNIVERSAL_DUMP_UNLOAD)
 end
 
-local VERSION = "0.2.0"
+local VERSION = "0.3.0"
 local Config = {
 	mainDir = "UniversalDumper",
 	debug = false,
@@ -48,6 +48,9 @@ local Config = {
 	liveWatchStats = true,
 	liveWatchCharacter = true,
 	liveInstallEarly = true,
+	snapshotDiff = true,
+	snapshotEvery = 20,
+	maxSnapshots = 10,
 	maxTreePerRoot = 60000,
 	maxGui = 20000,
 	maxScripts = 2000,
@@ -81,10 +84,12 @@ local SCRIPT_CLASSES = {
 	ModuleScript = true,
 	Script = true,
 }
-local REMOTE_PATTERNS = {
-	"InvokeServer%(%s*[\\\"']([^\\\"']+)[\\\"']",
-	"FireServer%(%s*[\\\"']([^\\\"']+)[\\\"']",
-	"OnClientEvent%(%s*[\\\"']([^\\\"']+)[\\\"']",
+local STATIC_REMOTE_METHODS = {
+	"FireServer",
+	"InvokeServer",
+	"OnClientEvent",
+	"OnClientInvoke",
+	"FireClient",
 }
 
 local function pickFn(...)
@@ -131,9 +136,11 @@ local TimedOut = {}
 local StaticRemoteRefs = {}
 local RemoteIndex = {}
 local ScriptSeen = {}
+local ScriptHashByPath = {}
 local ScriptMeta = {}
 local HashUsed = {}
 local ScriptIndex = { totalFound = 0, dumped = 0, failed = 0, timedOut = 0, items = {} }
+local Snap = { n = 0, last = nil, lastAt = 0 }
 local OUT = ""
 local WriteStats = { ok = 0, fail = 0, lastError = "" }
 local Log = { lines = {}, phase = "boot" }
@@ -170,6 +177,9 @@ local observeRemoteCall
 local wrapOnClientInvoke
 local hookRemoteIncoming
 local ensureRemoteRecord
+local takeSnapshot
+local writeManifest
+local writeAnalysisReport
 
 local function trackConn(conn)
 	if conn then
@@ -562,19 +572,25 @@ serializeValue = function(value, depth, seen, trunc)
 			return { type = "cycle" }
 		end
 		seen[value] = true
-		local out = {}
+		local entries = {}
 		local n = 0
 		for k, v in pairs(value) do
 			n += 1
 			if n > SERIAL_CAPS.tableEntries then
 				trunc.tableEntries = true
-				out.__truncated = true
 				break
 			end
-			local key = typeof(k) == "string" and k or tostring(k)
-			out[key] = serializeValue(v, depth + 1, seen, trunc)
+			table.insert(entries, {
+				k = serializeValue(k, depth + 1, seen, trunc),
+				v = serializeValue(v, depth + 1, seen, trunc),
+			})
 		end
-		return { type = "table", value = out }
+		seen[value] = nil
+		local row = { type = "table", entries = entries }
+		if trunc.tableEntries then
+			row.truncated = true
+		end
+		return row
 	end
 	return { type = t, value = tostring(value) }
 end
@@ -686,11 +702,46 @@ extractRemoteStrings = function(source, scriptPath)
 	if type(source) ~= "string" then
 		return
 	end
-	for _, pattern in ipairs(REMOTE_PATTERNS) do
-		for match in string.gmatch(source, pattern) do
-			StaticRemoteRefs[match] = StaticRemoteRefs[match] or {}
-			table.insert(StaticRemoteRefs[match], scriptPath)
+	local lineNo = 0
+	local function consider(line)
+		local trimmed = string.gsub(line, "^%s+", "")
+		if trimmed == "" or string.sub(trimmed, 1, 2) == "--" then
+			return
 		end
+		for _, method in ipairs(STATIC_REMOTE_METHODS) do
+			if string.find(line, method, 1, true) then
+				local ident = string.match(line, "([%w_]+)%s*:%s*" .. method)
+				if not ident then
+					ident = string.match(line, '%["([%w_]+)"%]%s*:?%s*' .. method)
+				end
+				if not ident then
+					ident = string.match(line, "%['([%w_]+)'%]%s*:?%s*" .. method)
+				end
+				if not ident then
+					ident = string.match(line, method .. "%s*%(%s*[\"']([^\"']+)[\"']")
+				end
+				local expr = trimmed
+				if #expr > 160 then
+					expr = string.sub(expr, 1, 160) .. "…"
+				end
+				table.insert(StaticRemoteRefs, {
+					script = scriptPath,
+					line = lineNo,
+					expression = expr,
+					method = method,
+					name = ident,
+					confidence = ident and "medium" or "low",
+				})
+			end
+		end
+	end
+	for line in string.gmatch(source, "[^\n]+") do
+		lineNo += 1
+		consider(line)
+	end
+	if not string.match(source, "\n$") and lineNo == 0 and #source > 0 then
+		lineNo = 1
+		consider(source)
 	end
 end
 
@@ -725,17 +776,26 @@ local function addScript(set, list, inst, sourceTag)
 		return
 	end
 	local path = instancePath(inst)
-	if set[path] then
+	local existing = set[path]
+	if existing then
+		for _, tag in ipairs(existing.discovery) do
+			if tag == sourceTag then
+				return
+			end
+		end
+		table.insert(existing.discovery, sourceTag)
 		return
 	end
-	set[path] = true
-	table.insert(list, {
+	local entry = {
 		script = inst,
 		path = path,
 		class = inst.ClassName,
 		source = sourceTag,
+		discovery = { sourceTag },
 		isNil = not inst:IsDescendantOf(game),
-	})
+	}
+	set[path] = entry
+	table.insert(list, entry)
 end
 
 local function collectAllScripts()
@@ -901,6 +961,27 @@ local function assessConfidence(scriptInst, source, status)
 		constants = constCount,
 		protos = protoCount,
 		confidence = confidence,
+		elapsed = nil,
+	}
+end
+
+local function scriptPipeline(status, syntax, bytecodeAvailable)
+	local sourceAvailable = status == "decompiled" or status == "cache"
+	local decompileAttempted = status ~= "skipped"
+	local validation = "n/a"
+	if syntax == "valid" then
+		validation = "passed"
+	elseif syntax == "invalid" then
+		validation = "failed"
+	end
+	return {
+		discovered = true,
+		identified = true,
+		sourceAvailable = sourceAvailable,
+		bytecodeAvailable = bytecodeAvailable == true,
+		decompileAttempted = decompileAttempted,
+		validated = syntax == "valid",
+		validation = validation,
 	}
 end
 
@@ -972,10 +1053,13 @@ end
 
 local function writeScriptMetadata()
 	ensureDir(OUT .. "/metadata")
-	writeJson("metadata/scripts.json", {
+	ensureDir(OUT .. "/scripts")
+	local payload = {
 		count = #ScriptMeta,
 		items = ScriptMeta,
-	})
+	}
+	writeJson("metadata/scripts.json", payload)
+	writeJson("scripts/metadata.json", payload)
 	writeJson("scripts-index.json", ScriptIndex)
 end
 
@@ -984,20 +1068,32 @@ dumpOneScript = function(entry)
 		path = entry.path,
 		class = entry.class,
 		source = entry.source,
+		discovery = entry.discovery or { entry.source },
 		isNil = entry.isNil,
-		replicatedScriptClass = entry.class == "Script",
+		serverClassInstance = entry.class == "Script",
+		serverOnlyRecovered = false,
 	}
 	local ok, err = pcall(function()
 		local scriptInst = entry.script
 		local started = os.clock()
 		local source = "-- decompile disabled"
 		local status = "skipped"
+		local bytecodeAvailable = false
+		if getBytecode then
+			pcall(function()
+				local bc = getBytecode(scriptInst)
+				bytecodeAvailable = type(bc) == "string" and #bc > 0
+			end)
+		end
 		if Config.decompile and decompileFn then
 			while (os.clock() - started) < Config.timeout do
 				local output, mode = decompileScript(scriptInst)
 				if output then
 					source = output
 					status = mode
+					if mode == "bytecode" then
+						bytecodeAvailable = true
+					end
 					break
 				end
 				task.wait(0.15)
@@ -1013,24 +1109,31 @@ dumpOneScript = function(entry)
 			if bok and bc then
 				source = "-- bytecode only\n" .. tostring(bc)
 				status = "bytecode"
+				bytecodeAvailable = true
 			end
 		end
 		local assess = assessConfidence(scriptInst, source, status)
+		local elapsed = os.clock() - started
+		assess.elapsed = elapsed
+		local pipeline = scriptPipeline(status, assess.syntax, bytecodeAvailable)
 		local hash = contentHash(scriptInst, source)
 		local relPath, storedHash = scriptFileName(hash, entry.path)
 		local header = string.format(
-			"-- name: %s\n-- path: %s\n-- class: %s\n-- collected: %s\n-- decompile: %s\n-- syntax: %s\n-- constants: %s\n-- protos: %s\n-- confidence: %s\n-- hash: %s\n-- elapsed: %.3fs\n\n%s%s",
+			"-- name: %s\n-- path: %s\n-- class: %s\n-- collected: %s\n-- discovery: %s\n-- decompile: %s\n-- syntax: %s\n-- validation: %s\n-- bytecode: %s\n-- constants: %s\n-- protos: %s\n-- confidence: %s\n-- hash: %s\n-- elapsed: %.3fs\n\n%s%s",
 			tostring(scriptInst.Name),
 			getFullNameForScript(scriptInst),
 			entry.class,
 			entry.source,
+			table.concat(entry.discovery or { entry.source }, ","),
 			assess.decompile,
 			assess.syntax,
+			pipeline.validation,
+			tostring(bytecodeAvailable),
 			tostring(assess.constants),
 			tostring(assess.protos),
 			assess.confidence,
 			storedHash,
-			os.clock() - started,
+			elapsed,
 			source,
 			buildDebugBlock(scriptInst)
 		)
@@ -1043,23 +1146,58 @@ dumpOneScript = function(entry)
 			item.confidence = assess.confidence
 			item.constants = assess.constants
 			item.protos = assess.protos
+			item.pipeline = pipeline
+			item.bytecodeAvailable = bytecodeAvailable
 			item.firstSeen = os.time()
 			ScriptsDumped += 1
-			table.insert(ScriptMeta, {
-				path = replacePlayerName(entry.path),
-				class = entry.class,
-				hash = storedHash,
-				file = relPath,
-				collected = entry.source,
-				first_seen = os.time(),
-				last_seen = os.time(),
-				decompile = assess.decompile,
-				syntax = assess.syntax,
-				constants = assess.constants,
-				protos = assess.protos,
-				confidence = assess.confidence,
-				isNil = entry.isNil,
-			})
+			ScriptHashByPath[entry.path] = storedHash
+			local displayPath = replacePlayerName(entry.path)
+			local existingMeta = nil
+			for _, meta in ipairs(ScriptMeta) do
+				if meta.path == displayPath then
+					existingMeta = meta
+					break
+				end
+			end
+			if existingMeta then
+				existingMeta.last_seen = os.time()
+				existingMeta.discovery = entry.discovery or existingMeta.discovery
+				if existingMeta.hash ~= storedHash then
+					existingMeta.versions = (existingMeta.versions or 1) + 1
+					existingMeta.hash_history = existingMeta.hash_history or { existingMeta.hash }
+					table.insert(existingMeta.hash_history, storedHash)
+					existingMeta.hash = storedHash
+					existingMeta.file = relPath
+					existingMeta.decompile = assess.decompile
+					existingMeta.syntax = assess.syntax
+					existingMeta.pipeline = pipeline
+					existingMeta.confidence = assess.confidence
+				end
+			else
+				table.insert(ScriptMeta, {
+					path = displayPath,
+					class = entry.class,
+					hash = storedHash,
+					file = relPath,
+					collected = entry.source,
+					discovery = entry.discovery or { entry.source },
+					first_seen = os.time(),
+					last_seen = os.time(),
+					versions = 1,
+					decompile = assess.decompile,
+					syntax = assess.syntax,
+					constants = assess.constants,
+					protos = assess.protos,
+					confidence = assess.confidence,
+					pipeline = pipeline,
+					source = pipeline.sourceAvailable,
+					bytecode = bytecodeAvailable,
+					validation = pipeline.validation,
+					isNil = entry.isNil,
+					serverClassInstance = entry.class == "Script",
+					serverOnlyRecovered = false,
+				})
+			end
 		else
 			item.status = "write_failed"
 			ScriptIndex.failed += 1
@@ -1187,43 +1325,67 @@ end
 
 writeRemoteCatalog = function()
 	local items = {}
-	for path, rec in pairs(RemoteIndex) do
+	for _, rec in pairs(RemoteIndex) do
+		rec.refs.static = {}
 		table.insert(items, rec)
 	end
 	table.sort(items, function(a, b)
 		return a.path < b.path
 	end)
-	local nameHits = {}
-	for name, scripts in pairs(StaticRemoteRefs) do
-		nameHits[name] = scripts
-	end
-	for _, rec in ipairs(items) do
-		local scripts = nameHits[rec.name]
-		if scripts then
-			rec.refs.static = scripts
-			nameHits[rec.name] = nil
+	local unmatched = {}
+	for _, ref in ipairs(StaticRemoteRefs) do
+		local attached = false
+		if ref.name then
+			for _, rec in ipairs(items) do
+				if rec.name == ref.name then
+					table.insert(rec.refs.static, ref)
+					attached = true
+				end
+			end
+		end
+		if not attached then
+			table.insert(unmatched, ref)
 		end
 	end
-	for name, scripts in pairs(nameHits) do
+	local byKey = {}
+	for _, ref in ipairs(unmatched) do
+		local key = ref.name or (tostring(ref.method) .. "@" .. tostring(ref.script) .. ":" .. tostring(ref.line))
+		byKey[key] = byKey[key] or {}
+		table.insert(byKey[key], ref)
+	end
+	for key, refs in pairs(byKey) do
 		table.insert(items, {
-			path = name,
+			path = key,
 			class = "Unknown",
-			name = name,
+			name = refs[1].name or key,
 			channel = "static-only",
-			refs = { instance = false, static = scripts, runtime = false },
+			refs = { instance = false, static = refs, runtime = false },
 			stats = { c2s = 0, s2c = 0 },
 			argSchema = {},
-			note = "regex match only — no RemoteEvent/RemoteFunction instance with this name was found",
+			confidence = "low",
+			note = "static reference only — no matching remote instance",
 		})
+	end
+	for _, rec in ipairs(items) do
+		if rec.refs.instance and rec.refs.runtime then
+			rec.confidence = "high"
+		elseif rec.refs.instance or rec.refs.runtime then
+			rec.confidence = "medium"
+		else
+			rec.confidence = "low"
+		end
 	end
 	table.sort(items, function(a, b)
 		return a.path < b.path
 	end)
-	writeJson("remote-catalog.json", {
-		note = "Instance-first remote index. refs.static is regex-on-source (one signal, not the catalog). Bindables are channel=bindable.",
+	local payload = {
+		note = "Instance-first remote index. refs.static is {script,line,expression,method,confidence}. Bindables are channel=bindable.",
 		count = #items,
 		items = items,
-	})
+	}
+	writeJson("remote-catalog.json", payload)
+	ensureDir(OUT .. "/remotes")
+	writeJson("remotes/catalog.json", payload)
 	Live.lastCatalogWrite = os.clock()
 end
 
@@ -1351,6 +1513,17 @@ local function dumpTree(root, label)
 			end
 		end
 		table.insert(rows, row)
+		local line = jsonEncode({
+			root = label,
+			path = row.path,
+			class = row.class,
+			name = row.name,
+			value = row.value,
+			attributes = row.attributes,
+		})
+		if line then
+			appendText("instances.jsonl", line .. "\n")
+		end
 	end
 	writeJson("trees/" .. label .. ".json", { root = label, count = #rows, items = rows })
 	log("done", "tree " .. label .. "=" .. #rows)
@@ -1359,6 +1532,8 @@ end
 local function dumpTrees()
 	Log.phase = "trees"
 	ensureDir(OUT .. "/trees")
+	writeText("instances.jsonl", "")
+	Live.fallbackFiles["instances.jsonl"] = ""
 	local roots = {
 		{ Workspace, "Workspace" },
 		{ ReplicatedStorage, "ReplicatedStorage" },
@@ -1373,6 +1548,229 @@ local function dumpTrees()
 			dumpTree(pair[1], pair[2])
 		end
 	end
+end
+
+local function fingerprintSig(value)
+	local enc = jsonEncode(value)
+	if not enc then
+		enc = jsonEncode(toJsonSafe(value))
+	end
+	return enc and fnv1aHex(enc) or "?"
+end
+
+local function snapshotRoots()
+	return { Workspace, ReplicatedStorage, ReplicatedFirst, StarterGui, StarterPack, LocalPlayer, Lighting }
+end
+
+local function captureSnapshotState()
+	local remotes, scripts, values, gui, attrs = {}, {}, {}, {}, {}
+	local n = 0
+	for _, root in ipairs(snapshotRoots()) do
+		if not root then
+			continue
+		end
+		local ok, desc = pcall(function()
+			return root:GetDescendants()
+		end)
+		if not ok or type(desc) ~= "table" then
+			continue
+		end
+		for _, inst in ipairs(desc) do
+			n += 1
+			if n % 400 == 0 then
+				task.wait()
+			end
+			local path = replacePlayerName(instancePath(inst))
+			if isNetworkRemote(inst) then
+				local rec = RemoteIndex[path]
+				remotes[path] = {
+					class = inst.ClassName,
+					c2s = rec and rec.stats.c2s or 0,
+					s2c = rec and rec.stats.s2c or 0,
+				}
+			elseif isScript(inst) and not isIgnored(inst) then
+				scripts[path] = {
+					class = inst.ClassName,
+					hash = ScriptHashByPath[instancePath(inst)] or ScriptHashByPath[path],
+				}
+			elseif inst:IsA("ValueBase") then
+				local ser = nil
+				pcall(function()
+					ser = serializeValue(inst.Value)
+				end)
+				values[path] = fingerprintSig(ser)
+			elseif inst:IsA("GuiObject") then
+				gui[path] = { class = inst.ClassName, visible = inst.Visible }
+			end
+			if Config.dumpAttributes then
+				local a = inst:GetAttributes()
+				if a and next(a) then
+					attrs[path] = fingerprintSig(serializeValue(a))
+				end
+			end
+		end
+	end
+	for path, rec in pairs(RemoteIndex) do
+		if rec.channel == "network" and not remotes[path] then
+			remotes[path] = { class = rec.class, c2s = rec.stats.c2s, s2c = rec.stats.s2c }
+		end
+	end
+	return {
+		remotes = remotes,
+		scripts = scripts,
+		values = values,
+		gui = gui,
+		attrs = attrs,
+	}
+end
+
+local function mapDiff(oldMap, newMap)
+	local added, removed, changed = {}, {}, {}
+	oldMap = oldMap or {}
+	newMap = newMap or {}
+	for path, nv in pairs(newMap) do
+		local ov = oldMap[path]
+		if ov == nil then
+			table.insert(added, path)
+		else
+			local osig = type(ov) == "table" and (jsonEncode(ov) or fingerprintSig(ov)) or tostring(ov)
+			local nsig = type(nv) == "table" and (jsonEncode(nv) or fingerprintSig(nv)) or tostring(nv)
+			if osig ~= nsig then
+				table.insert(changed, { path = path, before = ov, after = nv })
+			end
+		end
+	end
+	for path in pairs(oldMap) do
+		if newMap[path] == nil then
+			table.insert(removed, path)
+		end
+	end
+	return added, removed, changed
+end
+
+writeAnalysisReport = function()
+	local validated, bytecodeOnly = 0, 0
+	for _, meta in ipairs(ScriptMeta) do
+		if meta.validation == "passed" then
+			validated += 1
+		end
+		if meta.bytecode and not meta.source then
+			bytecodeOnly += 1
+		end
+	end
+	local remoteInst, runtimeObs, staticOnly, highR = 0, 0, 0, 0
+	for _, rec in pairs(RemoteIndex) do
+		if rec.refs.instance then
+			remoteInst += 1
+		end
+		if rec.refs.runtime then
+			runtimeObs += 1
+		end
+		if rec.channel == "static-only" then
+			staticOnly += 1
+		end
+		if rec.confidence == "high" then
+			highR += 1
+		end
+	end
+	ensureDir(OUT .. "/analysis")
+	writeJson("analysis/report.json", {
+		at = os.time(),
+		scripts = {
+			scriptInstances = ScriptIndex.totalFound,
+			dumped = ScriptsDumped,
+			validated = validated,
+			bytecodeOnly = bytecodeOnly,
+		},
+		remotes = {
+			instances = remoteInst,
+			runtimeObserved = runtimeObs,
+			staticOnly = staticOnly,
+			highConfidence = highR,
+		},
+		snapshots = Snap.n,
+		serverOnlyRecovered = 0,
+	})
+end
+
+writeManifest = function()
+	writeJson("manifest.json", {
+		schema = "roblox-dumper/v0.3",
+		version = VERSION,
+		mode = "client",
+		files = {
+			metadata = "metadata.json",
+			scripts = "scripts/metadata.json",
+			remotes = "remotes/catalog.json",
+			observations = "remotes/observations.jsonl",
+			instances = "instances.jsonl",
+			live = "live/events.jsonl",
+			snapshots = "snapshots/",
+			analysis = "analysis/",
+			visibility = "server-visibility.json",
+		},
+		snapshots = Snap.n,
+		scriptsDumped = ScriptsDumped,
+		liveEvents = Live.n,
+	})
+end
+
+takeSnapshot = function()
+	if not Config.snapshotDiff or OUT == "" then
+		return
+	end
+	if Snap.n >= Config.maxSnapshots then
+		return
+	end
+	local state = captureSnapshotState()
+	Snap.n += 1
+	local id = Snap.n
+	local rec = {
+		id = id,
+		at = os.time(),
+		clock = os.clock(),
+		counts = { remotes = 0, scripts = 0, values = 0, gui = 0, attrs = 0 },
+		remotes = state.remotes,
+		scripts = state.scripts,
+		values = state.values,
+		gui = state.gui,
+		attrs = state.attrs,
+	}
+	for _ in pairs(state.remotes) do
+		rec.counts.remotes += 1
+	end
+	for _ in pairs(state.scripts) do
+		rec.counts.scripts += 1
+	end
+	for _ in pairs(state.values) do
+		rec.counts.values += 1
+	end
+	for _ in pairs(state.gui) do
+		rec.counts.gui += 1
+	end
+	for _ in pairs(state.attrs) do
+		rec.counts.attrs += 1
+	end
+	ensureDir(OUT .. "/snapshots")
+	writeJson(string.format("snapshots/%06d.json", id), rec)
+	if Snap.last then
+		local prev = Snap.last
+		local diff = { from = prev.id, to = id, at = rec.at }
+		diff.remotesAdded, diff.remotesRemoved, diff.remotesChanged = mapDiff(prev.remotes, rec.remotes)
+		diff.scriptsAdded, diff.scriptsRemoved, diff.scriptsChanged = mapDiff(prev.scripts, rec.scripts)
+		diff.valuesAdded, diff.valuesRemoved, diff.valuesChanged = mapDiff(prev.values, rec.values)
+		diff.guiAdded, diff.guiRemoved, diff.guiChanged = mapDiff(prev.gui, rec.gui)
+		diff.attrsAdded, diff.attrsRemoved, diff.attrsChanged = mapDiff(prev.attrs, rec.attrs)
+		local encoded = jsonEncode(diff)
+		if encoded then
+			appendText("analysis/diffs.jsonl", encoded .. "\n")
+		end
+	end
+	Snap.last = rec
+	Snap.lastAt = os.clock()
+	pcall(writeManifest)
+	pcall(writeAnalysisReport)
+	log("done", string.format("snapshot %06d remotes=%d scripts=%d values=%d", id, rec.counts.remotes, rec.counts.scripts, rec.counts.values))
 end
 
 --[=[ live intercept ]=]
@@ -1443,6 +1841,21 @@ flushLiveLogs = function()
 		end
 		if #lines == 0 or appendText("live/events.jsonl", table.concat(lines, "\n") .. "\n") then
 			flushed = #pending
+			local obs = {}
+			for _, ev in ipairs(pending) do
+				if ev.dir == "C2S" or ev.dir == "S2C" then
+					local ol = jsonEncode(ev)
+					if not ol then
+						ol = jsonEncode(toJsonSafe(ev))
+					end
+					if ol then
+						table.insert(obs, ol)
+					end
+				end
+			end
+			if #obs > 0 then
+				appendText("remotes/observations.jsonl", table.concat(obs, "\n") .. "\n")
+			end
 			Live.pending = {}
 		end
 	end
@@ -1484,12 +1897,18 @@ local function pushRemoteEvent(dir, method, remote, args, n, returns, retN, sour
 		trunc = nil
 	end
 	observeRemoteCall(path, className, dir, argTypes)
+	local role = "event"
+	if method == "OnClientInvoke" or method == "InvokeServer" then
+		role = "invoke"
+	end
 	livePush({
 		dir = dir,
 		method = method,
 		source = source,
 		remote = path,
 		class = className,
+		family = className,
+		role = role,
 		args = argsSer,
 		returns = retSer,
 		argsText = argsText,
@@ -1571,6 +1990,33 @@ local function dumpLateScript(inst, sourceTag)
 	end
 	local path = instancePath(inst)
 	if ScriptSeen[path] then
+		local newHash = nil
+		if getScriptHash then
+			pcall(function()
+				newHash = getScriptHash(inst)
+			end)
+		end
+		local old = ScriptHashByPath[path]
+		if type(newHash) == "string" and newHash ~= "" and old and newHash ~= old and ScriptsDumped < Config.maxScripts then
+			dumpOneScript({
+				script = inst,
+				path = path,
+				class = inst.ClassName,
+				source = "hash-changed",
+				discovery = { "hash-changed" },
+				isNil = not inst:IsDescendantOf(game),
+			})
+			writeScriptMetadata()
+			livePush({
+				dir = "INST",
+				method = "ScriptHashChanged",
+				remote = replacePlayerName(path),
+				class = inst.ClassName,
+				argsText = old .. " -> " .. newHash,
+				source = sourceTag,
+			})
+			return
+		end
 		for _, meta in ipairs(ScriptMeta) do
 			if meta.path == replacePlayerName(path) then
 				meta.last_seen = os.time()
@@ -1595,6 +2041,7 @@ local function dumpLateScript(inst, sourceTag)
 		path = path,
 		class = inst.ClassName,
 		source = sourceTag,
+		discovery = { sourceTag },
 		isNil = not inst:IsDescendantOf(game),
 	}
 	dumpOneScript(entry)
@@ -1851,6 +2298,11 @@ local function installLiveIntercept()
 				end
 			end
 		end
+		if Config.snapshotDiff and Snap.n > 0 and Snap.n < Config.maxSnapshots then
+			if (os.clock() - Snap.lastAt) > Config.snapshotEvery then
+				pcall(takeSnapshot)
+			end
+		end
 	end))
 	flushLiveLogs()
 	log("done", "LIVE INTERCEPT ACTIVE — play the game, watch live/net.log grow")
@@ -1898,7 +2350,7 @@ local function writeLimitations()
 		"  • Server-only ModuleScripts never required on the client",
 		"  • Server remote handlers and server runtime state",
 		"",
-		"server-access.json is a diagnostic of the client view of those containers.",
+		"server-visibility.json is a diagnostic of the client view of those containers.",
 		"An empty or filtered tree is expected. It is not a failed server dump.",
 		"",
 		"For an authorized server dump of a place you own, use a Studio collector",
@@ -1959,12 +2411,14 @@ local function runAll()
 			RunService:Set3dRenderingEnabled(false)
 		end)
 	end
-	writeJson("server-access.json", {
+	local visibility = {
 		note = "Diagnostic of the client view of non-replicated containers. This is not a server dump.",
 		items = probeNonReplicatedContainers(),
-	})
+	}
+	writeJson("server-visibility.json", visibility)
+	writeJson("server-access.json", visibility)
 	writeLimitations()
-	writeJson("meta.json", {
+	local metaPayload = {
 		at = os.time(),
 		version = VERSION,
 		mode = "client",
@@ -1987,23 +2441,26 @@ local function runAll()
 			getinfo = getInfo ~= nil,
 			httprequest = httpRequest ~= nil,
 		},
-	})
+	}
+	writeJson("meta.json", metaPayload)
+	writeJson("metadata.json", metaPayload)
 	local scriptList = collectAllScripts()
-	local replicatedScriptClass = 0
+	local serverClassInstances = 0
 	for _, entry in ipairs(scriptList) do
 		if entry.class == "Script" then
-			replicatedScriptClass += 1
+			serverClassInstances += 1
 		end
 	end
-	log("boot", string.format("found %d scripts (%d Script-class replicated to client)", #scriptList, replicatedScriptClass))
+	log("boot", string.format("found %d scripts (%d Script-class visible to client; serverOnlyRecovered=0)", #scriptList, serverClassInstances))
 	writeJson("script-inventory.json", {
-		count = #scriptList,
-		replicatedScriptClass = replicatedScriptClass,
-		note = "Script-class count is instances visible to the client, not ServerScriptService source.",
+		scriptInstances = #scriptList,
+		serverClassInstances = serverClassInstances,
+		serverOnlyRecovered = 0,
+		note = "serverClassInstances are Script-class objects visible to the client, not recovered ServerScriptService source.",
 		sample = (function()
 			local s = {}
 			for i = 1, math.min(20, #scriptList) do
-				s[i] = { scriptList[i].path, scriptList[i].class, scriptList[i].source }
+				s[i] = { scriptList[i].path, scriptList[i].class, scriptList[i].source, scriptList[i].discovery }
 			end
 			return s
 		end)(),
@@ -2039,6 +2496,9 @@ local function runAll()
 		runPhase("hooks", installLiveIntercept)
 		writePhase("hooks_done")
 	end
+	pcall(takeSnapshot)
+	pcall(writeManifest)
+	pcall(writeAnalysisReport)
 	writeJson("complete.json", {
 		at = os.time(),
 		ok = true,
@@ -2047,10 +2507,12 @@ local function runAll()
 		output = OUT,
 		diskPath = DISK_ROOT .. OUT:gsub("/", "\\"),
 		writes = WriteStats,
-		scriptsFound = #scriptList,
+		scriptInstances = #scriptList,
 		scriptsDumped = ScriptsDumped,
-		replicatedScriptClass = replicatedScriptClass,
-		message = "Client dump complete. Keep playing — live/events.jsonl captures observed remotes.",
+		serverClassInstances = serverClassInstances,
+		serverOnlyRecovered = 0,
+		snapshots = Snap.n,
+		message = "Client dump complete. Keep playing — live/events.jsonl and snapshots/ update while you play.",
 	})
 	writeText("log.txt", table.concat(Log.lines, "\n"))
 	if Config.disableRender then
@@ -2085,6 +2547,9 @@ env.UNIVERSAL_DUMP_UNLOAD = function()
 	end
 	pcall(flushLiveLogs)
 	pcall(writeRemoteCatalog)
+	pcall(takeSnapshot)
+	pcall(writeManifest)
+	pcall(writeAnalysisReport)
 	pcall(function()
 		RunService:Set3dRenderingEnabled(true)
 	end)
