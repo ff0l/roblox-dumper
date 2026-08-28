@@ -1,0 +1,2 @@
+*.lua linguist-detectable=true linguist-language=Lua
+*.luau linguist-detectable=true linguist-language=Lua
